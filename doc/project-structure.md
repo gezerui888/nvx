@@ -21,6 +21,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend and an opt-in native-agent backend |
 | `nvx-rs` | Rust crate `nvx-rs`, library `nvx`: the NVX mechanics that the OpenVMM backend builds on |
+| `tests/runtime-adapter` | Rust crate `runtime-adapter`: an independent adapter that CI builds against `nvx-rs` through its public API |
 | `openvmm` | Public OpenVMM Git submodule from `microsoft/openvmm`, tracking its `feature/microvm/dev` branch |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
@@ -158,6 +159,10 @@ nvx/
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
+|-- tests/                       Tests that build on the repository's crates from outside them
+|   `-- runtime-adapter/         Rust crate `runtime-adapter`, an independent adapter of nvx-rs
+|       |-- src/                 Its library, and its host and guest skeleton binaries
+|       `-- tests/               Consumer-contract scenario C0, the independent build
 |-- SECURITY.md                 Microsoft security vulnerability reporting policy
 |-- .dockerignore                Docker build-context exclusions
 |-- .gitattributes               Git path attributes
@@ -323,6 +328,16 @@ see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 [remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
 `publish_development_release.py` to publish development releases.
 
+### `tests/`
+
+Tests that build on the repository's crates from outside them.
+`runtime-adapter/` is an independent adapter of the NVX runtime: a standalone
+crate with its own `Cargo.lock` that depends on `nvx-rs` with default features
+off and uses its public API only. Its protocol-only, host-only, and guest-only
+configurations build in CI, and its tests check that each one builds as an
+independent adapter's does. See its
+[README](../tests/runtime-adapter/README.md).
+
 ## Root files
 
 | Path | Responsibility |
@@ -353,6 +368,7 @@ see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 | `openvmm/target/` | Rust build output produced inside the OpenVMM submodule |
 | `aci_edge_sandboxes/target/` | Rust build output of the `aci_edge_sandboxes` crate |
 | `nvx-rs/target/` | Rust build output of the `nvx-rs` crate |
+| `tests/runtime-adapter/target/` | Rust build output of the runtime adapter |
 | `.ruff_cache/` | Ruff's local lint cache |
 | `__pycache__/` | Python bytecode caches that may appear below Python source directories |
 

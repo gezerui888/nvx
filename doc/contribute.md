@@ -76,6 +76,7 @@ the Python, shell, and link checks.
 | Markdown files and `doc/` paths | Every relative link and image in a tracked Markdown file resolves to a tracked file, and every anchor to a heading slug that GitHub generates, ignoring code. Every `doc/` path that a tracked file mentions resolves too, except the test fixtures that `DOC_PATH_FIXTURES` lists. | [check-quality](../.github/actions/check-quality/action.yml), [check_markdown_links.py](../scripts/check_markdown_links.py) |
 | `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crates](ci.md#rust-crates) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
 | `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, a macOS check, and, through `nvx.py`, the musl lint, tests, build, digest manifest, and static-ELF check of the guest binaries; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
+| `tests/runtime-adapter/` | rustfmt, then Clippy with warnings denied, the build, the tests, and the minimum supported Rust version of `nvx-rs`, in the protocol-only, host-only, and, on Linux, static musl guest-only configurations; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
 | NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows | [validate-nvx](../.github/actions/validate-nvx/action.yml) |
 
 check-quality names each shell script that it checks, and a CLI test fails
@@ -114,7 +115,11 @@ source and integration tests in their `tests` directories. The latter also
 runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of the NVX
 mechanics, such as the golden fixtures of the control protocol, belong in
 `nvx-rs`, and tests of the ACI Edge Sandboxes contract in
-`aci_edge_sandboxes`. The `scripts/nvx.py test-aci-edge-sandboxes --backend
+`aci_edge_sandboxes`. Tests of what an independent adapter observes through
+the public API of `nvx-rs` alone, such as the consumer-contract scenarios of
+[microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535), belong in the
+[runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the
+microVM jobs run on each backend. The `scripts/nvx.py test-aci-edge-sandboxes --backend
 BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,
 which exercises both crates, and `scripts/nvx.py test-agent-bundling` checks
 the crate's agent bundle staging without one. [Continuous integration](ci.md)

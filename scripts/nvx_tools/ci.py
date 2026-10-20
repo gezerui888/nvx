@@ -108,10 +108,12 @@ CI_CHANGE_OUTPUTS = (
 )
 CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
 # Inputs of the hypervisor test suites: OpenVMM, the guests that the microVM
-# tests boot, the Rust crates that test-aci-edge-sandboxes runs, the CLI and
-# workflows that drive the suites, and the runners.
+# tests boot, the Rust crates that test-aci-edge-sandboxes runs, the runtime
+# adapter whose scenarios the microVM workflow runs, the CLI and workflows that
+# drive the suites, and the runners.
 CI_TEST_INPUT_PATHS = re.compile(
     r"^(openvmm($|/)|aci_edge_sandboxes/|nvx-rs/|azurelinux/|"
+    r"tests/runtime-adapter/|"
     r"\.github/workflows/"
     r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"

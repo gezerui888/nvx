@@ -1,0 +1,43 @@
+[package]
+name = "runtime-adapter"
+version = "0.1.0"
+edition = "2024"
+# The minimum supported Rust version of nvx-rs, which a test keeps equal.
+rust-version = "1.89"
+description = "An independent adapter of the NVX runtime, built on nvx-rs through its public API only"
+license = "MIT"
+repository = "https://github.com/microsoft/nvx"
+readme = "README.md"
+publish = false
+
+[features]
+# No default features: each configuration selects one side of nvx-rs, as an independent adapter
+# does. Without features, the adapter builds against the protocol-only nvx-rs.
+default = []
+# The host half: the host API of nvx-rs and the `runtime-adapter-host` binary.
+host = ["nvx-rs/host"]
+# The guest half: the guest API of nvx-rs and the `runtime-adapter-guest` binary, which builds as a
+# static `x86_64-unknown-linux-musl` executable.
+guest = ["nvx-rs/guest"]
+
+[dependencies]
+nvx-rs = { path = "../../nvx-rs", default-features = false }
+
+# The binaries have no unit tests; tests/independent_build.rs runs them.
+[[bin]]
+name = "runtime-adapter-host"
+path = "src/bin/runtime-adapter-host.rs"
+required-features = ["host"]
+test = false
+
+[[bin]]
+name = "runtime-adapter-guest"
+path = "src/bin/runtime-adapter-guest.rs"
+required-features = ["guest"]
+test = false
+
+[lints.rust]
+missing_docs = "warn"
+# The adapter reaches nvx-rs through its public API alone.
+unsafe_code = "forbid"
+unreachable_pub = "warn"

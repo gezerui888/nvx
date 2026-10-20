@@ -1180,6 +1180,26 @@ jobs:
           --backend "${{ inputs.backend }}"
           --output-dir "build/test-results/aci-edge-sandboxes-${{ inputs.backend }}"
 
+      # The hook of the runtime adapter's scenarios on this backend: the ignored
+      # tests of its host-only configuration, which later steps add and which
+      # read the backend through `nvx::Hypervisor::from_env_or_default`. There
+      # are none yet, so these steps only build the adapter.
+      - name: Run runtime adapter scenarios on Linux
+        if: runner.os != 'Windows' && !inputs.debug-kernel
+        shell: bash
+        working-directory: tests/runtime-adapter
+        env:
+          NVX_HYPERVISOR: ${{ inputs.backend }}
+        run: cargo test --locked --features host -- --ignored
+
+      - name: Run runtime adapter scenarios on Windows
+        if: runner.os == 'Windows' && !inputs.debug-kernel
+        shell: powershell
+        working-directory: tests/runtime-adapter
+        env:
+          NVX_HYPERVISOR: ${{ inputs.backend }}
+        run: cargo test --locked --features host -- --ignored
+
       - name: Upload NVX microVM failure logs
         if: failure()
         uses: actions/upload-artifact@v7

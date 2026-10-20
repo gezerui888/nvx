@@ -477,8 +477,9 @@ participate in the decision:
   producers, and the platform benchmarks.
 - `run-tests` is true when a test input changed: the OpenVMM pin, the guests
   and their package locks, the CLI and its modules, the workflows and actions
-  that build and run the tests, the runner setup scripts, the Rust pin, or the
-  `aci_edge_sandboxes` and `nvx-rs` crates. It enables the NVX microVM tests.
+  that build and run the tests, the runner setup scripts, the Rust pin, the
+  `aci_edge_sandboxes` and `nvx-rs` crates, or the runtime adapter in
+  `tests/runtime-adapter/`. It enables the NVX microVM tests.
 - `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
   suites. A push sets both to `run-tests`. A pull request sets each only when
   one of that suite's own inputs changed. The unit tests depend on the OpenVMM
@@ -629,6 +630,18 @@ and the prebuilt-binary integration run to
 and Docker guest build, and Alpine, Ubuntu, and Azure Linux ship its nine
 executables.
 
+The `nvx-rs` job also checks the
+[runtime adapter](../tests/runtime-adapter/README.md) in
+`tests/runtime-adapter/`, an independent adapter that builds on `nvx-rs` with a
+lockfile of its own, default features off, and the public API only. For each
+of its configurations, protocol-only, host-only, and, on Linux, guest-only for
+`x86_64-unknown-linux-musl`, the action runs Clippy with warnings denied, the
+build, the tests, and a check with the minimum Rust version of `nvx-rs`, after
+rustfmt. The tests check consumer-contract scenario C0: each configuration
+enables only its side of `nvx-rs`, the guest-only build pulls in neither Tokio
+nor a dependency that only the host side declares, and the guest binary is a
+static executable.
+
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release. Before it uploads
@@ -646,6 +659,13 @@ environments and working directories. On failure
 it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
 therefore trigger the NVX microVM test matrix.
+
+The same jobs, except the debug-kernel ones, run the runtime adapter's
+scenarios on their backend: the ignored tests of its host-only configuration,
+with `NVX_HYPERVISOR` naming the backend. Later steps of
+[microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535) add them; until
+then, the step only builds the adapter. Changes under `tests/runtime-adapter/`
+therefore trigger the NVX microVM test matrix too.
 
 ## Adversarial campaigns
 

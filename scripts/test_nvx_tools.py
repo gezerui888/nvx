@@ -3668,6 +3668,58 @@ class CiConfigurationTests(unittest.TestCase):
             build,
         )
 
+    def test_nvx_rs_checks_the_runtime_adapter_in_each_configuration(self):
+        # The runtime adapter builds on nvx-rs as an independent adapter does,
+        # with a lockfile of its own and default features off. Each
+        # configuration is linted, built, tested, and checked with the minimum
+        # Rust version of nvx-rs; the guest-only one builds the static musl
+        # executable that guests run, so it needs Linux.
+        root = BuildConstants.REPO_ROOT
+        action = (
+            root / ".github" / "actions" / "check-nvx-rs" / "action.yml"
+        ).read_text(encoding="utf-8")
+        adapter = root / "tests" / "runtime-adapter"
+        manifest = (adapter / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            'nvx-rs = { path = "../../nvx-rs", default-features = false }\n', manifest
+        )
+        self.assertIn("\ndefault = []\n", manifest)
+        self.assertTrue((adapter / "Cargo.lock").is_file())
+        toolchain = '"+${{ steps.toolchains.outputs.toolchain }}"'
+        msrv = '"+${{ steps.toolchains.outputs.msrv }}"'
+        musl = "x86_64-unknown-linux-musl"
+        for configuration, options in (
+            ("protocol-only", ""),
+            ("host-only", " --features host"),
+            ("guest-only", f" --features guest --target {musl}"),
+        ):
+            with self.subTest(configuration=configuration):
+                name = f"Check the runtime adapter's {configuration} configuration"
+                step = _composite_action_step(action, name)
+                self.assertIn("      working-directory: tests/runtime-adapter\n", step)
+                self.assertEqual(
+                    "      if: runner.os == 'Linux'\n" in step,
+                    configuration == "guest-only",
+                )
+                script = " ".join(
+                    _composite_action_script(action, name).replace("\\\n", " ").split()
+                )
+                self.assertTrue(script.startswith("set -euo pipefail "))
+                for command in (
+                    f"cargo {toolchain} clippy --locked --all-targets{options} "
+                    "-- -D warnings",
+                    f"cargo {toolchain} build --locked{options}",
+                    f"cargo {toolchain} test --locked{options}",
+                    f"cargo {msrv} check --locked --all-targets{options}",
+                ):
+                    self.assertIn(command, script)
+                if configuration == "protocol-only":
+                    self.assertIn(f"cargo {toolchain} fmt --all --check", script)
+                if configuration == "guest-only":
+                    self.assertIn(
+                        f'rustup target add --toolchain "${{toolchain}}" {musl}', script
+                    )
+
     def test_required_ci_result_policy(self):
         always_successful = {
             "quality",
@@ -3901,6 +3953,7 @@ class CiConfigurationTests(unittest.TestCase):
             (("aci_edge_sandboxes/src/lib.rs",), (True, True, False, False)),
             (("nvx-rs/src/lib.rs",), (True, True, False, True)),
             (("nvx-rs/Cargo.lock",), (True, True, False, True)),
+            (("tests/runtime-adapter/src/lib.rs",), (True, True, False, False)),
             (("scripts/nvx_tools/microvm_tests.py",), (True, True, False, False)),
             (
                 (".github/workflows/run-nvx-microvm-tests.yml",),
@@ -3935,6 +3988,67 @@ class CiConfigurationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unsupported CI event"):
             ci.classify_ci_changes("workflow_dispatch", ["openvmm"])
+
+    def test_ci_change_classification_runs_microvm_tests_for_the_runtime_adapter(self):
+        # The microVM jobs run the runtime adapter's scenarios on every backend,
+        # so a change to the adapter alone runs them. Neither OpenVMM suite
+        # builds or boots the adapter.
+        workflow = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "workflows"
+            / "run-nvx-microvm-tests.yml"
+        ).read_text(encoding="utf-8")
+        for system in ("Linux", "Windows"):
+            with self.subTest(system=system):
+                hook = _workflow_step(
+                    workflow, "test", f"Run runtime adapter scenarios on {system}"
+                )
+                self.assertIn("!inputs.debug-kernel", hook)
+                self.assertIn("working-directory: tests/runtime-adapter\n", hook)
+                self.assertIn("NVX_HYPERVISOR: ${{ inputs.backend }}\n", hook)
+                self.assertIn(
+                    "run: cargo test --locked --features host -- --ignored", hook
+                )
+        adapter = (
+            "tests/runtime-adapter/Cargo.toml",
+            "tests/runtime-adapter/Cargo.lock",
+            "tests/runtime-adapter/src/lib.rs",
+            "tests/runtime-adapter/src/bin/runtime-adapter-guest.rs",
+            "tests/runtime-adapter/tests/independent_build.rs",
+        )
+        for changed_files in (*((path,) for path in adapter), adapter):
+            with self.subTest(changed_files=changed_files):
+                changes = ci.classify_ci_changes("pull_request", changed_files)
+                self.assertEqual(changes, ci.CiChanges(True, True, False, False))
+                self.assertEqual(
+                    ci.classify_ci_changes("push", changed_files),
+                    ci.CiChanges(True, True, True, True),
+                )
+                expected = ci.required_ci_expected_results(
+                    "pull_request", same_repository=True, changes=changes
+                )
+                for job in (
+                    *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+                    *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+                ):
+                    self.assertEqual(expected[job], "success", job)
+                for job in (
+                    *ci.REQUIRED_CI_OPENVMM_TEST_JOBS,
+                    *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+                ):
+                    self.assertEqual(expected[job], "skipped", job)
+        summary = ci.describe_ci_changes(
+            "pull_request",
+            adapter,
+            ci.classify_ci_changes("pull_request", adapter),
+        )
+        self.assertIn(
+            "### NVX microVM tests: run\nTest inputs changed: "
+            "`tests/runtime-adapter/Cargo.toml`, `tests/runtime-adapter/Cargo.lock`, "
+            "`tests/runtime-adapter/src/lib.rs`, and 2 more.\n",
+            summary,
+        )
 
     def test_ci_change_classification_covers_each_suite_input(self):
         github = BuildConstants.REPO_ROOT / ".github"
