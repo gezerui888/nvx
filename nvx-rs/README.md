@@ -33,7 +33,8 @@ nvx-rs/
 │   │                the sandbox launch profile of `nvx.py`, with the Python semantics they keep;
 │   │                with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   ├── guest/       feature `guest`: the programs that run in Linux guests, and the library
+│   │                through which a guest init or agent starts a program
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, and guest-binary tests, and the golden fixtures that Python
 │                    recorded for the ports of its code, in fixtures/
@@ -58,6 +59,7 @@ nvx-rs/
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
+| `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -478,7 +480,10 @@ as `nvx/`.
 
 The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
-Linux images ship all nine at their established `/sbin/nvx-*` paths.
+Linux images ship all nine at their established `/sbin/nvx-*` paths. The
+module's `spawn` library, which starts a program in a new process, is not a
+program: `nvx-managed-agent` launches its workloads through it, and any other
+guest init or agent can too.
 
 | Binary | Program |
 | --- | --- |

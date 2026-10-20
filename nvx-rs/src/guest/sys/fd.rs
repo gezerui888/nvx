@@ -180,6 +180,13 @@ impl io::Read for FileDescriptor {
     }
 }
 
+/// Gives up the descriptor to its new owner, which `crate::guest::spawn` hands to a child.
+impl From<FileDescriptor> for OwnedFd {
+    fn from(descriptor: FileDescriptor) -> Self {
+        descriptor.0
+    }
+}
+
 /// Opens `path` with typed `flags` and `mode`, returning an owned descriptor.
 pub(crate) fn open(path: &CStr, flags: OpenFlags, mode: Mode) -> Result<FileDescriptor, Errno> {
     nix::fcntl::open(path, flags, mode).map(FileDescriptor)

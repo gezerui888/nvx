@@ -1,7 +1,12 @@
-//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`.
+//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and the library
+//! through which a guest init or agent starts a program.
 //!
-//! Each module holds one program, and the crate's binary of the same name runs its `main`. The
-//! programs keep the command lines, exit statuses, and output of the C programs that they
+//! Each program module holds one program, and the crate's binary of the same name runs its
+//! `main`. The [`spawn`] module is a library instead: it starts a program in a new process for
+//! any guest init or agent, without NVX's control protocol, managed agent, or workload identity,
+//! and NVX's managed agent starts its workloads through it.
+//!
+//! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
 //! test hooks take negative numbers, or `0x`-prefixed hexadecimal where the C program also read
 //! hexadecimal, floating-point arguments plain decimal with an optional exponent, error messages
@@ -15,14 +20,14 @@
 //!
 //! # Conventions
 //!
-//! - Program modules deny unsafe code. Only the private `sys` module may use it, behind
-//!   documented safe operations. It makes every system call through `nix`, with the enabled,
-//!   default-free feature set, or through the standard library, which reads and writes whole
-//!   files and the MSR devices, except the few managed-agent and time-tool operations that
-//!   neither provides, which `sys` documents, and the programs take random bytes from the
-//!   `getrandom` crate. `sys` also names the kernel's and the processor's interfaces once: the
-//!   procfs, sysfs, and device paths, OpenVMM's I/O ports, CPUID leaves and MSRs, and the
-//!   kernel's flags, so that the programs refer to them by name.
+//! - Program and library modules deny unsafe code. Only the private `sys` module may use it,
+//!   behind documented safe operations. It makes every system call through `nix`, with the
+//!   enabled, default-free feature set, or through the standard library, which reads and writes
+//!   whole files and the MSR devices, except the few spawn, managed-agent, and time-tool
+//!   operations that neither provides, which `sys` documents, and the programs take random bytes
+//!   from the `getrandom` crate. `sys` also names the kernel's and the processor's interfaces
+//!   once: the procfs, sysfs, and device paths, OpenVMM's I/O ports, CPUID leaves and MSRs, and
+//!   the kernel's flags, so that the programs refer to them by name.
 //! - Descriptors and mappings have owners that release them when dropped. Where a C program
 //!   reported a cleanup failure, a consuming `close` or `unmap` returns it instead. Raw
 //!   descriptor integers never leave `sys`, and no resource is dropped by hand: where a C
@@ -66,6 +71,7 @@ pub mod managed_agent;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
 pub mod reseed;
+pub mod spawn;
 #[cfg(target_arch = "x86_64")]
 pub mod time;
 #[cfg(target_arch = "x86_64")]

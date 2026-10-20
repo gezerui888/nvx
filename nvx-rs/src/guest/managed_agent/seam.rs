@@ -1,9 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 
-use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, OpenFlags, ProcessId};
-
-use super::launch::{self, SpawnRequest};
+use crate::guest::spawn::{Command, Spawned};
+use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, OpenFlags};
 
 /// Production paths used by the managed agent and replaceable paths used by tests.
 #[derive(Clone, Debug)]
@@ -92,8 +91,8 @@ pub(crate) trait System {
         arguments: &[CString],
         environment: Option<&[CString]>,
     ) -> Result<(), Errno>;
-    /// Spawns one managed workload.
-    fn spawn(&mut self, request: SpawnRequest<'_>) -> Result<ProcessId, Errno>;
+    /// Spawns one workload's launch command.
+    fn spawn(&mut self, command: Command) -> Result<Spawned, Errno>;
 }
 
 /// Production implementation backed exclusively by safe `guest::sys` APIs.
@@ -171,8 +170,8 @@ impl System for RealSystem {
         Err(sys::exec(path, arguments, environment))
     }
 
-    fn spawn(&mut self, request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
-        launch::spawn(&self.paths, request)
+    fn spawn(&mut self, command: Command) -> Result<Spawned, Errno> {
+        command.spawn().map_err(|error| sys::errno_of(&error))
     }
 }
 
@@ -194,8 +193,8 @@ pub(crate) struct TestSystem {
     pub(crate) fail_environment: Option<Vec<u8>>,
     pub(crate) execs: Vec<RecordedExec>,
     pub(crate) spawn_calls: usize,
-    /// Spawns each workload when set; `spawn` otherwise fails with `ENOSYS`.
-    pub(crate) spawner: Option<fn(SpawnRequest<'_>) -> Result<ProcessId, Errno>>,
+    /// Spawns each workload's launch command when set; `spawn` otherwise fails with `ENOSYS`.
+    pub(crate) spawner: Option<fn(Command) -> Result<Spawned, Errno>>,
     pub(crate) tty_configured: usize,
     pub(crate) tty_drained: usize,
     pub(crate) close_barrier_reader: Option<FileDescriptor>,
@@ -330,11 +329,51 @@ impl System for TestSystem {
         Ok(())
     }
 
-    fn spawn(&mut self, request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
+    fn spawn(&mut self, command: Command) -> Result<Spawned, Errno> {
         self.spawn_calls += 1;
         match self.spawner {
-            Some(spawner) => spawner(request),
+            Some(spawner) => spawner(command),
             None => Err(Errno::ENOSYS),
         }
     }
+}
+
+/// Spawns a launch command as the privileged agent does, without privileges: the child's
+/// credential calls are replaced and succeed, and it enters the working directory with the test's
+/// own credentials.
+#[cfg(test)]
+pub(crate) fn spawn_as_privileged(command: Command) -> Result<Spawned, Errno> {
+    command
+        .simulate_credentials(None)
+        .spawn()
+        .map_err(|error| sys::errno_of(&error))
+}
+
+/// Spawns a launch command whose replaced credential calls fail with `EPERM`, as `setgroups`
+/// does without privileges.
+#[cfg(test)]
+pub(crate) fn spawn_with_failing_credentials(command: Command) -> Result<Spawned, Errno> {
+    command
+        .simulate_credentials(Some(Errno::EPERM))
+        .spawn()
+        .map_err(|error| sys::errno_of(&error))
+}
+
+/// Writes an executable stand-in for `setpriv` in `directory` and returns its path.
+///
+/// The stand-in runs the shell command `action`, then executes the workload that follows the
+/// helper's `--` separator, without changing credentials and without the helper. `action` runs
+/// after the direct child has entered its working directory and before the workload runs.
+#[cfg(test)]
+pub(crate) fn setpriv_shim(directory: &Path, action: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join("setpriv");
+    let script = format!(
+        "#!/bin/sh\nset -e\n{action}\nwhile [ \"$#\" -gt 0 ]; do\n    argument=$1\n    shift\n    \
+         if [ \"$argument\" = -- ]; then\n        break\n    fi\ndone\nexec \"$@\"\n"
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }

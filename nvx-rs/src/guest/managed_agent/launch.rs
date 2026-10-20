@@ -1,144 +1,129 @@
 use std::os::unix::ffi::OsStrExt;
 
 use crate::guest::parse::parse_decimal;
-use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string};
+use crate::guest::spawn::{Cgroup, Command};
+use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, c_string};
 use crate::protocol::GuestExecPayload;
 
 use super::AgentConfig;
 use super::environment;
 use super::seam::{Paths, path_c_string};
 
-/// Child report stage for failure to enter the requested working directory.
-pub(crate) const LAUNCH_STAGE_CWD: i32 = sys::CHILD_STAGE_CWD;
-/// Borrowed launch inputs and owned descriptor endpoints prepared by the execution engine.
-pub(crate) struct SpawnRequest<'a> {
+/// One workload's launch inputs: its borrowed request, and the descriptors that its child takes.
+pub(crate) struct LaunchRequest<'a> {
     /// Agent mode and configured workload identity.
     pub(crate) config: &'a AgentConfig,
     /// Decoded workload request.
     pub(crate) execution: &'a GuestExecPayload,
-    /// Sealed helper configuration.
-    pub(crate) config_fd: &'a FileDescriptor,
-    /// Parent reader and child writer for standard output.
-    pub(crate) stdout_pipe: (&'a FileDescriptor, &'a FileDescriptor),
-    /// Parent reader and child writer for standard error.
-    pub(crate) stderr_pipe: (&'a FileDescriptor, &'a FileDescriptor),
-    /// Direct-child launch report pipe, absent in sandbox mode.
-    pub(crate) launch_pipe: Option<(&'a FileDescriptor, &'a FileDescriptor)>,
+    /// Sealed helper configuration, which the child keeps open for the helper.
+    pub(crate) config_fd: FileDescriptor,
+    /// Writer of the workload's standard output.
+    pub(crate) stdout: FileDescriptor,
+    /// Writer of the workload's standard error.
+    pub(crate) stderr: FileDescriptor,
 }
 
-/// Safe, fully allocated fork/exec plan.
-struct Plan {
-    /// System-layer plan that owns every child input.
-    inner: sys::SpawnPlan,
-}
-
-/// Builds a launch plan and crosses the safe fork/exec boundary.
-pub(crate) fn spawn(paths: &Paths, request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
-    let mut plan = Plan::new(paths, &request)?;
-    let descriptors = sys::SpawnDescriptors::managed(
-        request.config_fd,
-        request.stdout_pipe,
-        request.stderr_pipe,
-        request.launch_pipe,
-    );
-    sys::spawn(&mut plan.inner, descriptors)
-}
-
-impl Plan {
-    /// Allocates and validates every input needed after `fork`.
-    fn new(paths: &Paths, request: &SpawnRequest<'_>) -> Result<Self, Errno> {
-        let config_fd = request.config_fd.argument();
-        let directory = c_string(request.execution.cwd.as_deref().unwrap_or(b"/"))?;
-        let uid = parse_id(request.config.uid.as_bytes())?;
-        let gid = parse_id(request.config.gid.as_bytes())?;
-        let helper = path_c_string(&paths.helper)?;
-        let launcher = path_c_string(&paths.launcher)?;
-        let setpriv = path_c_string(&paths.setpriv)?;
-        let mut arguments = Vec::new();
-        let program;
-        let mut environment = environment::inherited()?;
-        let mut physical_pwd = None;
-        if request.config.direct {
-            program = setpriv;
-            for value in [
-                b"setpriv".as_slice(),
-                b"--reuid",
-                request.config.uid.as_bytes(),
-                b"--regid",
-                request.config.gid.as_bytes(),
-                b"--clear-groups",
-                b"--no-new-privs",
-                b"--bounding-set=-all",
-                b"--inh-caps=-all",
-                b"--ambient-caps=-all",
-                helper.as_bytes(),
-                b"--exec-config-fd",
-                config_fd.as_bytes(),
-                b"--",
-            ] {
-                arguments.push(c_string(value)?);
-            }
-            environment::set(&mut environment, b"HOME", request.config.home.as_bytes())?;
-            environment::set(&mut environment, b"USER", request.config.user.as_bytes())?;
-            environment::set(&mut environment, b"LOGNAME", request.config.user.as_bytes())?;
-            if request.execution.environment.is_none() || request.execution.inherit_default_env {
-                if directory.to_bytes() == b"/" || super::helper::safe_path(directory.to_bytes()) {
-                    environment::set(&mut environment, b"PWD", directory.to_bytes())?;
-                } else {
-                    physical_pwd = Some(sys::PhysicalPwd::new(
-                        &mut environment,
-                        b"PWD=".len() + crate::protocol::MAX_ARGUMENT_BYTES,
-                    )?);
-                }
-            }
-        } else {
-            program = launcher.clone();
-            for value in [
-                launcher.as_bytes(),
-                paths.barrier.as_os_str().as_bytes(),
-                request.config.rootfs.as_bytes(),
-                request.config.hostname.as_bytes(),
-                request.config.uid.as_bytes(),
-                request.config.gid.as_bytes(),
-                request.config.user.as_bytes(),
-                request.config.home.as_bytes(),
-            ] {
-                arguments.push(c_string(value)?);
-            }
-            environment::set(
-                &mut environment,
-                b"NVX_EXEC_CONFIG_FD",
-                config_fd.as_bytes(),
-            )?;
+/// Builds the command that launches one workload in the agent's mode.
+///
+/// In both modes the workload's standard input is the null device, its standard output and error
+/// are the request's pipes, the sealed configuration stays open at its descriptor number, and the
+/// child leads a new process group. The direct agent runs `setpriv`, which takes the workload's
+/// identity and runs the helper; its child first enters the working directory as the workload,
+/// records the physical path in `PWD` for a noncanonical name, and joins the execution cgroup.
+/// The sandbox agent runs the container launcher, which enters the sandbox's root and identity.
+pub(crate) fn command(paths: &Paths, request: LaunchRequest<'_>) -> Result<Command, Errno> {
+    let config_fd = request.config_fd.argument();
+    let directory = c_string(request.execution.cwd.as_deref().unwrap_or(b"/"))?;
+    let uid = parse_id(request.config.uid.as_bytes())?;
+    let gid = parse_id(request.config.gid.as_bytes())?;
+    let helper = path_c_string(&paths.helper)?;
+    let launcher = path_c_string(&paths.launcher)?;
+    let setpriv = path_c_string(&paths.setpriv)?;
+    let mut arguments = Vec::new();
+    let program;
+    let mut environment = environment::inherited()?;
+    let mut physical_pwd = false;
+    if request.config.direct {
+        program = setpriv;
+        for value in [
+            b"setpriv".as_slice(),
+            b"--reuid",
+            request.config.uid.as_bytes(),
+            b"--regid",
+            request.config.gid.as_bytes(),
+            b"--clear-groups",
+            b"--no-new-privs",
+            b"--bounding-set=-all",
+            b"--inh-caps=-all",
+            b"--ambient-caps=-all",
+            helper.as_bytes(),
+            b"--exec-config-fd",
+            config_fd.as_bytes(),
+            b"--",
+        ] {
+            arguments.push(c_string(value)?);
         }
-        for argument in &request.execution.argv {
-            arguments.push(c_string(argument)?);
+        environment::set(&mut environment, b"HOME", request.config.home.as_bytes())?;
+        environment::set(&mut environment, b"USER", request.config.user.as_bytes())?;
+        environment::set(&mut environment, b"LOGNAME", request.config.user.as_bytes())?;
+        if request.execution.environment.is_none() || request.execution.inherit_default_env {
+            if directory.to_bytes() == b"/" || super::helper::safe_path(directory.to_bytes()) {
+                environment::set(&mut environment, b"PWD", directory.to_bytes())?;
+            } else {
+                physical_pwd = true;
+            }
         }
-        let cgroup_procs = if request.config.direct {
-            let path = path_c_string(&paths.cgroup_root.join("nvx-exec/cgroup.procs"))?;
-            Some(sys::open(
-                &path,
-                OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC,
-                Mode::empty(),
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            inner: sys::SpawnPlan::managed(
-                program,
-                arguments,
-                environment,
-                physical_pwd,
-                directory,
-                uid,
-                gid,
-                cgroup_procs,
-                path_c_string(&paths.null_device)?,
-                request.config.direct,
-            )?,
-        })
+    } else {
+        program = launcher.clone();
+        for value in [
+            launcher.as_bytes(),
+            paths.barrier.as_os_str().as_bytes(),
+            request.config.rootfs.as_bytes(),
+            request.config.hostname.as_bytes(),
+            request.config.uid.as_bytes(),
+            request.config.gid.as_bytes(),
+            request.config.user.as_bytes(),
+            request.config.home.as_bytes(),
+        ] {
+            arguments.push(c_string(value)?);
+        }
+        environment::set(
+            &mut environment,
+            b"NVX_EXEC_CONFIG_FD",
+            config_fd.as_bytes(),
+        )?;
     }
+    for argument in &request.execution.argv {
+        arguments.push(c_string(argument)?);
+    }
+    let cgroup = if request.config.direct {
+        let directory = paths.cgroup_root.join("nvx-exec");
+        Some(Cgroup::open(&directory).map_err(|error| sys::errno_of(&error))?)
+    } else {
+        None
+    };
+    let null = sys::open(
+        &path_c_string(&paths.null_device)?,
+        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut command = Command::new(program, arguments)
+        .environment(environment)
+        .stdin(null)
+        .stdout(request.stdout)
+        .stderr(request.stderr)
+        .inherit(request.config_fd)
+        .new_process_group();
+    if let Some(cgroup) = cgroup {
+        command = command
+            .working_directory(directory)
+            .check_working_directory_as(uid, gid)
+            .cgroup(cgroup);
+        if physical_pwd {
+            command = command.export_physical_working_directory();
+        }
+    }
+    Ok(command)
 }
 
 /// Parses one nonzero decimal UID or GID while excluding the unchanged-ID sentinel.
@@ -153,6 +138,7 @@ fn parse_id(text: &[u8]) -> Result<u32, Errno> {
 mod tests {
     use std::ffi::CString;
 
+    use crate::guest::sys::PreparedChild;
     use crate::protocol::GuestExecPayload;
 
     use super::*;
@@ -183,19 +169,23 @@ mod tests {
         FileDescriptor::from_owned(tempfile::tempfile().unwrap().into())
     }
 
-    fn request<'a>(
-        config: &'a AgentConfig,
-        execution: &'a GuestExecPayload,
-        descriptor: &'a FileDescriptor,
-    ) -> SpawnRequest<'a> {
-        SpawnRequest {
+    /// Prepares the child that launches `execution` with `config`, and returns it with the
+    /// number of its sealed configuration descriptor.
+    fn prepare(
+        paths: &Paths,
+        config: &AgentConfig,
+        execution: &GuestExecPayload,
+    ) -> (PreparedChild, CString) {
+        let config_fd = descriptor();
+        let argument = config_fd.argument();
+        let request = LaunchRequest {
             config,
             execution,
-            config_fd: descriptor,
-            stdout_pipe: (descriptor, descriptor),
-            stderr_pipe: (descriptor, descriptor),
-            launch_pipe: Some((descriptor, descriptor)),
-        }
+            config_fd,
+            stdout: descriptor(),
+            stderr: descriptor(),
+        };
+        (command(paths, request).unwrap().prepare(), argument)
     }
 
     #[test]
@@ -211,11 +201,8 @@ mod tests {
         };
         let config = config(true);
         let execution = execution();
-        let descriptor = descriptor();
-        let descriptor_argument = descriptor.argument();
-        let plan = Plan::new(&paths, &request(&config, &execution, &descriptor)).unwrap();
+        let (plan, descriptor_argument) = prepare(&paths, &config, &execution);
         let arguments: Vec<_> = plan
-            .inner
             .arguments()
             .iter()
             .map(|argument| argument.to_bytes())
@@ -241,9 +228,8 @@ mod tests {
                 b"ok",
             ]
         );
-        assert_eq!(plan.inner.program().as_bytes(), b"/test/setpriv");
+        assert_eq!(plan.program().as_bytes(), b"/test/setpriv");
         let environment: Vec<_> = plan
-            .inner
             .environment()
             .iter()
             .map(|entry| entry.to_bytes())
@@ -256,7 +242,7 @@ mod tests {
         ] {
             assert!(environment.contains(&expected), "{expected:?}");
         }
-        assert!(plan.inner.has_cgroup());
+        assert!(plan.has_cgroup());
     }
 
     #[test]
@@ -268,10 +254,8 @@ mod tests {
         };
         let config = config(false);
         let execution = execution();
-        let descriptor = descriptor();
-        let plan = Plan::new(&paths, &request(&config, &execution, &descriptor)).unwrap();
+        let (plan, _) = prepare(&paths, &config, &execution);
         let arguments: Vec<_> = plan
-            .inner
             .arguments()
             .iter()
             .map(|argument| argument.to_bytes())
@@ -292,12 +276,11 @@ mod tests {
             ]
         );
         assert!(
-            plan.inner
-                .environment()
+            plan.environment()
                 .iter()
                 .any(|entry| entry.as_bytes().starts_with(b"NVX_EXEC_CONFIG_FD="))
         );
-        assert!(!plan.inner.has_cgroup());
+        assert!(!plan.has_cgroup());
     }
 
     #[test]
@@ -333,34 +316,30 @@ mod tests {
                 cwd: Some(cwd.to_vec()),
                 ..execution()
             };
-            let descriptor = descriptor();
-            let plan = Plan::new(&paths, &request(&config, &execution, &descriptor)).unwrap();
-            let slot = plan.inner.physical_pwd().expect("PWD is deferred");
+            let (plan, _) = prepare(&paths, &config, &execution);
+            let slot = plan.physical_pwd().expect("PWD is deferred");
             assert_eq!(&slot[..4], b"PWD=");
             assert!(slot[4..].iter().all(|&byte| byte == 0));
             assert!(
-                plan.inner
-                    .environment()
+                plan.environment()
                     .iter()
                     .all(|entry| !entry.as_bytes().starts_with(b"PWD="))
             );
-            assert!(plan.inner.physical_pwd_index().is_some());
-            assert!(plan.inner.has_cgroup());
+            assert!(plan.physical_pwd_index().is_some());
+            assert!(plan.has_cgroup());
         }
 
         let execution = GuestExecPayload {
             cwd: Some(b"/symlinked/component".to_vec()),
             ..execution()
         };
-        let descriptor = descriptor();
-        let plan = Plan::new(&paths, &request(&config, &execution, &descriptor)).unwrap();
-        assert!(plan.inner.physical_pwd().is_none());
+        let (plan, _) = prepare(&paths, &config, &execution);
+        assert!(plan.physical_pwd().is_none());
         assert!(
-            plan.inner
-                .environment()
+            plan.environment()
                 .iter()
                 .any(|entry| entry.as_bytes() == b"PWD=/symlinked/component")
         );
-        assert!(plan.inner.has_cgroup());
+        assert!(plan.has_cgroup());
     }
 }

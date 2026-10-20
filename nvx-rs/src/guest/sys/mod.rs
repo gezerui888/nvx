@@ -19,15 +19,16 @@
 //! directly, so the standard library's line buffer for standard output must stay empty, which
 //! the guest module ensures by denying the standard library's print macros.
 //!
-//! The managed agent needs a few operations that `nix` cannot provide, which reach libc through
-//! `nix`'s re-export: its forked child, which may neither allocate nor drop an owner, closes,
-//! executes, and exits through libc; its wait-status decoding keeps the real-time signals that
-//! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
-//! inherits by number, which it cannot borrow before it knows that the descriptor is open. So do
-//! the time tools, for the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`,
-//! `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`, which musl does not implement for
-//! one thread; and the `clock_gettime` and `getpid` system calls, which the latency probe
-//! measures without the vDSO's or libc's shortcuts. Each such call says why.
+//! The spawn boundary and the managed agent need a few operations that `nix` cannot provide,
+//! which reach libc through `nix`'s re-export: a spawned child, which may neither allocate nor
+//! drop an owner, fills its preallocated `PWD` entry, executes, and exits through libc; the
+//! agent's wait-status decoding keeps the real-time signals that `nix`'s `Signal` cannot
+//! represent; and its execution helper duplicates the descriptor that it inherits by number,
+//! which it cannot borrow before it knows that the descriptor is open. So do the time tools, for
+//! the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`,
+//! and `_exit`; `sched_setscheduler`, which musl does not implement for one thread; and the
+//! `clock_gettime` and `getpid` system calls, which the latency probe measures without the vDSO's
+//! or libc's shortcuts. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -109,7 +110,7 @@ pub(crate) use sock_diag::{
 #[cfg(test)]
 pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
 pub(crate) use socket::{UdpSocket, connect_datagram};
-pub(crate) use spawn::{CHILD_STAGE_CWD, PhysicalPwd, SpawnDescriptors, SpawnPlan, spawn};
+pub(crate) use spawn::{ChildSpec, PreparedChild, REPORT_LENGTH};
 pub(crate) use terminal::{configure_raw, drain};
 pub(crate) use timer::Timer;
 

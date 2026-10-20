@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use crate::guest::spawn::{LaunchReport, LaunchStage};
 use crate::guest::sys::{
     self, ChildStatus, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string,
 };
@@ -12,7 +13,7 @@ use super::AgentConfig;
 use super::cgroup;
 use super::diagnostics::with_description;
 use super::exec_config;
-use super::launch::{LAUNCH_STAGE_CWD, SpawnRequest};
+use super::launch::{self, LaunchRequest};
 use super::seam::{System, path_c_string};
 use super::session::{DataFailureKind, Session};
 use super::tty;
@@ -181,7 +182,7 @@ pub(crate) fn run(
         }
     }
 
-    let launch_report = report.map_or(Ok(None), read_launch_failure);
+    let launch_report = report.wait();
     if config.direct
         && let Err(error) = cgroup::settle(system)
     {
@@ -196,15 +197,22 @@ pub(crate) fn run(
         return Ok(());
     }
     match launch_report {
-        Ok(Some((LAUNCH_STAGE_CWD, status))) => {
-            return refuse_cwd(session, request_id, execution, status);
-        }
-        Ok(Some((_, status))) => {
-            super::diagnostics::error(system, "exec-launch", status);
-            return session.send_error(request_id, 125, LAUNCH_FAILED);
-        }
+        Ok(Some(failure)) => match failure.stage() {
+            LaunchStage::WorkingDirectory => {
+                return refuse_cwd(session, request_id, execution, failure.raw_os_error());
+            }
+            LaunchStage::Credentials
+            | LaunchStage::PhysicalWorkingDirectory
+            | LaunchStage::Cgroup => {
+                super::diagnostics::error(system, "exec-launch", failure.raw_os_error());
+                return session.send_error(request_id, 125, LAUNCH_FAILED);
+            }
+            // The other stages end the child with status 125 before the workload runs, which
+            // the agent reports as the workload's exit status, as the C agent did.
+            _ => {}
+        },
         Err(error) => {
-            super::diagnostics::error(system, "exec-launch-report", error as i32);
+            super::diagnostics::error(system, "exec-launch-report", sys::errno_of(&error) as i32);
         }
         Ok(None) => {}
     }
@@ -242,14 +250,14 @@ struct Launched {
     stdout: FileDescriptor,
     /// Reader of the workload's standard error.
     stderr: FileDescriptor,
-    /// Reader of the direct child's launch report, absent in sandbox mode.
-    report: Option<FileDescriptor>,
+    /// Report of the workload's launch stages.
+    report: LaunchReport,
 }
 
 /// Creates the workload's pipes and sealed configuration, then spawns it.
 ///
-/// The configuration and the child's pipe ends close when this returns, as the C agent closed
-/// them after `fork`.
+/// The launch command takes the configuration and the child's pipe ends, which the agent closes
+/// once the child exists, as the C agent closed them after `fork`.
 fn launch(
     system: &mut impl System,
     config: &AgentConfig,
@@ -258,25 +266,22 @@ fn launch(
     let (stdout, stdout_writer) = sys::create_pipe()?;
     let (stderr, stderr_writer) = sys::create_pipe()?;
     let config_fd = exec_config::create(execution, config.direct)?;
-    let (report, report_writer) = if config.direct {
-        let (reader, writer) = sys::create_pipe()?;
-        (Some(reader), Some(writer))
-    } else {
-        (None, None)
-    };
-    let child = system.spawn(SpawnRequest {
-        config,
-        execution,
-        config_fd: &config_fd,
-        stdout_pipe: (&stdout, &stdout_writer),
-        stderr_pipe: (&stderr, &stderr_writer),
-        launch_pipe: report.as_ref().zip(report_writer.as_ref()),
-    })?;
+    let command = launch::command(
+        system.paths(),
+        LaunchRequest {
+            config,
+            execution,
+            config_fd,
+            stdout: stdout_writer,
+            stderr: stderr_writer,
+        },
+    )?;
+    let spawned = system.spawn(command)?;
     Ok(Launched {
-        child,
+        child: spawned.process(),
         stdout,
         stderr,
-        report,
+        report: spawned.into_report(),
     })
 }
 
@@ -464,30 +469,6 @@ fn drain(descriptor: &FileDescriptor) -> StreamResult {
             Err(sys::Errno::EAGAIN) => return StreamResult::Open,
             Err(_) => return StreamResult::Failed,
         }
-    }
-}
-
-/// Reads the optional fixed-size direct-child launch report.
-///
-/// The reader closes when this returns, as the C agent closed it after reading.
-fn read_launch_failure(descriptor: FileDescriptor) -> Result<Option<(i32, i32)>, Errno> {
-    let mut bytes = [0u8; 8];
-    let mut length = 0;
-    while length < bytes.len() {
-        match descriptor.read(&mut bytes[length..]) {
-            Ok(count) if count > 0 => length += count,
-            Ok(_) => break,
-            Err(Errno::EINTR) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    match length {
-        0 => Ok(None),
-        8 => Ok(Some((
-            i32::from_ne_bytes(bytes[..4].try_into().expect("four bytes")),
-            i32::from_ne_bytes(bytes[4..].try_into().expect("four bytes")),
-        ))),
-        _ => Err(Errno::EPROTO),
     }
 }
 

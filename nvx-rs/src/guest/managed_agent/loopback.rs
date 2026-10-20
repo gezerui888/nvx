@@ -1,19 +1,17 @@
 use std::collections::VecDeque;
-use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::guest::sys::{self, Errno, FileDescriptor, ProcessId, c_string};
+use crate::guest::sys::{self, Errno, FileDescriptor};
 use crate::host::platform::Transport;
 use crate::protocol::{
     self, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_GUEST_ATTACH, OUTER_HEADER_LEN,
     OUTER_HOST_ATTACH, OUTER_READY, OUTER_RESET, OuterHeader,
 };
 
-use super::launch::SpawnRequest;
-use super::seam::{Paths, TestSystem};
+use super::seam::{Paths, TestSystem, setpriv_shim, spawn_as_privileged};
 
 struct BrokerCore {
     guest: UnixStream,
@@ -262,25 +260,6 @@ impl BrokerHandle {
     }
 }
 
-fn spawn_unprivileged(request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
-    let arguments: Vec<CString> = request
-        .execution
-        .argv
-        .iter()
-        .map(|argument| c_string(argument))
-        .collect::<Result<_, _>>()?;
-    let directory = c_string(request.execution.cwd.as_deref().unwrap_or(b"/"))?;
-    let program = arguments.first().cloned().ok_or(Errno::EPROTO)?;
-    let mut plan = sys::SpawnPlan::plain(program, arguments, directory, c"/dev/null".to_owned());
-    let descriptors = sys::SpawnDescriptors::plain(
-        request.config_fd,
-        request.stdout_pipe,
-        request.stderr_pipe,
-        request.launch_pipe,
-    );
-    sys::spawn(&mut plan, descriptors)
-}
-
 fn protocol_error() -> io::Error {
     io::Error::from(Errno::EPROTO)
 }
@@ -358,13 +337,16 @@ mod tests {
         let hostfs = temporary.path().join("hostfs");
         std::fs::create_dir_all(hostfs.join("root/0/source")).unwrap();
         let target = temporary.path().join("mapped");
+        // The workloads run through the agent's real direct launch, whose credential calls are
+        // replaced and whose `setpriv` executes each workload unchanged.
         let paths = Paths {
             cgroup_root: cgroup,
             hostfs_dir: hostfs,
+            setpriv: setpriv_shim(temporary.path(), ":"),
             ..Paths::default()
         };
         let system = TestSystem {
-            spawner: Some(spawn_unprivileged),
+            spawner: Some(spawn_as_privileged),
             ..TestSystem::new(paths)
         };
         let (broker_guest, agent) = UnixStream::pair().unwrap();

@@ -20,11 +20,15 @@
 //! port, TTY operations, the helper's inherited descriptor and `exec`, the workload launch, and
 //! the production paths are behind a system seam. Production implements it with the safe `sys`
 //! wrappers; tests substitute temporary directories and recording operations, including failures
-//! of mount, barrier write, environment export, and `exec`.
+//! of mount, barrier write, environment export, and `exec`, and spawn workloads through the real
+//! launch with its credential calls replaced and a stand-in `setpriv`.
 //!
-//! The fork boundary receives only owned C strings, owned descriptors, and precomputed
-//! descriptor actions. Before `fork` it constructs the complete `argv` and `envp`, and the child
-//! performs no allocation or Rust cleanup before `execve` or `_exit`. The helper builds the
+//! The agent launches each workload as one caller of [`spawn`](crate::guest::spawn): it builds
+//! the workload's command, with the complete `argv` and `envp`, its descriptors, and in direct
+//! mode its working-directory check and cgroup, and the spawned child performs no allocation or
+//! Rust cleanup before `execve` or `_exit`. The agent keeps its own policy: the null device as
+//! the workload's standard input, the identity and the `setpriv` and helper stages, the output
+//! cap, and the outcome that it reports for a failed launch stage. The helper builds the
 //! workload's environment in memory too, as C's environment functions changed its own, and
 //! passes it to `execve`, so neither process changes its environment.
 //!
@@ -52,7 +56,7 @@ mod exec;
 mod exec_config;
 /// Short-lived post-privilege-drop helper mode.
 mod helper;
-/// Precomputed direct and sandbox launch plans.
+/// Direct and sandbox launch commands.
 mod launch;
 #[cfg(all(test, feature = "host"))]
 /// In-process host/broker/agent integration harness.

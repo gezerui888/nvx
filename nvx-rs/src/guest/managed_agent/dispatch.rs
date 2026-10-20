@@ -156,7 +156,7 @@ mod tests {
     use std::thread;
 
     use crate::protocol::{
-        APP_ERROR, APP_EXIT, APP_STDERR, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH,
+        APP_ERROR, APP_EXIT, APP_STDERR, APP_STDOUT, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH,
         OUTER_HEADER_LEN, OUTER_RECEIVE_WINDOW, OuterHeader, Workload, WorkloadEnvironment,
         decode_ack_payload, decode_app, decode_credit_payload, decode_outer_header, encode_app,
         encode_exec_payload, encode_outer,
@@ -757,5 +757,202 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    /// Returns the payload of an `EXEC` request for `argv` in `cwd`, with the default environment.
+    fn workload_payload(argv: &[&str], cwd: Option<&str>) -> Vec<u8> {
+        encode_exec_payload(&Workload {
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            timeout_ms: 0,
+            cwd,
+            environment: WorkloadEnvironment::Default,
+        })
+        .unwrap()
+    }
+
+    /// Returns whether the tests run as root, whose credentials the directory check would bypass.
+    fn is_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
+    }
+
+    /// Spawns a launch command with its real credential calls.
+    fn spawn_with_real_credentials(
+        command: crate::guest::spawn::Command,
+    ) -> Result<crate::guest::spawn::Spawned, Errno> {
+        command
+            .spawn()
+            .map_err(|error| crate::guest::sys::errno_of(&error))
+    }
+
+    #[test]
+    fn direct_launch_refuses_working_directories_that_the_workload_cannot_enter() {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_CWD_REFUSAL_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::direct_launch_refuses_working_directories_that_the_workload_cannot_enter",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (temporary, mut system) = direct_system();
+        let root = temporary.path();
+        // As root, the child takes the workload's real identity, which must reach the
+        // directories; otherwise its credential calls are replaced, and the test's own identity
+        // meets the same refusals.
+        if is_root() {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            system.spawner = Some(spawn_with_real_credentials);
+        } else {
+            system.spawner = Some(super::super::seam::spawn_as_privileged);
+        }
+        system.paths.setpriv = super::super::seam::setpriv_shim(root, ":");
+        let file = root.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let unsearchable = root.join("unsearchable");
+        std::fs::create_dir(&unsearchable).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        let marker = root.join("ran");
+        let marker = marker.to_str().unwrap();
+        let mut harness = Harness::with_system(true, system, 0);
+        for (request_id, directory, error) in [
+            (42, root.join("missing"), Errno::ENOENT),
+            (43, file, Errno::ENOTDIR),
+            (44, unsearchable, Errno::EACCES),
+        ] {
+            let directory = directory.to_str().unwrap();
+            let diagnostic = super::super::diagnostics::with_description(
+                format!("nvx-managed-agent: cannot enter working directory {directory}: ")
+                    .as_bytes(),
+                error,
+            );
+            assert_eq!(
+                harness.request_all(
+                    request_id,
+                    APP_EXEC,
+                    &workload_payload(&["/bin/touch", marker], Some(directory)),
+                ),
+                vec![
+                    response(APP_STDERR, request_id, 0, &diagnostic),
+                    response(APP_ERROR, request_id, error as i32, b"cwd-failed"),
+                ],
+                "{directory}"
+            );
+        }
+        let system = harness.stop();
+        assert_eq!(system.spawn_calls, 3);
+        assert!(system.diagnostics.is_empty());
+        assert!(!std::path::Path::new(marker).exists());
+    }
+
+    #[test]
+    fn direct_launch_refuses_a_failed_identity_change_and_runs_nothing() {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_IDENTITY_FAILURE_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::direct_launch_refuses_a_failed_identity_change_and_runs_nothing",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (temporary, mut system) = direct_system();
+        system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
+        system.spawner = Some(super::super::seam::spawn_with_failing_credentials);
+        let marker = temporary.path().join("ran");
+        let mut harness = Harness::with_system(true, system, 0);
+        assert_eq!(
+            harness.request_all(
+                42,
+                APP_EXEC,
+                &workload_payload(&["/bin/touch", marker.to_str().unwrap()], None),
+            ),
+            vec![response(
+                APP_ERROR,
+                42,
+                125,
+                protocol::LAUNCH_FAILED.as_bytes()
+            )]
+        );
+        let system = harness.stop();
+        assert_eq!(
+            system.diagnostics,
+            format!(
+                "NVX-MANAGED-ERROR: stage=exec-launch status={}\n",
+                Errno::EPERM as i32
+            )
+            .as_bytes()
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn direct_launch_starts_the_workload_in_the_directory_that_it_checked() {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_CHECKED_DIRECTORY_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::direct_launch_starts_the_workload_in_the_directory_that_it_checked",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (temporary, mut system) = direct_system();
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let checked = root.join("checked");
+        let moved = root.join("moved");
+        let first = root.join("first");
+        let second = root.join("second");
+        let link = root.join("link");
+        for directory in [&checked, &first, &second] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        // Between the check and the workload, the stand-in `setpriv` renames the checked
+        // directory and retargets the link.
+        system.paths.setpriv = super::super::seam::setpriv_shim(
+            &root,
+            &format!(
+                "if [ -d '{checked}' ]; then mv '{checked}' '{moved}'; fi\nln -sfn '{second}' '{link}'",
+                checked = checked.display(),
+                moved = moved.display(),
+                second = second.display(),
+                link = link.display(),
+            ),
+        );
+        system.spawner = Some(super::super::seam::spawn_as_privileged);
+        let mut harness = Harness::with_system(true, system, 0);
+        let renamed = harness.request_all(
+            42,
+            APP_EXEC,
+            &workload_payload(&["/bin/sh", "-c", "pwd -P"], checked.to_str()),
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let retargeted = harness.request_all(
+            43,
+            APP_EXEC,
+            &workload_payload(&["/bin/sh", "-c", "pwd -P"], link.to_str()),
+        );
+        let system = harness.stop();
+        let line = |path: &std::path::Path| [path.as_os_str().as_bytes(), b"\n"].concat();
+        assert_eq!(
+            renamed,
+            vec![
+                response(APP_STDOUT, 42, 0, &line(&moved)),
+                response(APP_EXIT, 42, 0, b"exit"),
+            ]
+        );
+        assert_eq!(
+            retargeted,
+            vec![
+                response(APP_STDOUT, 43, 0, &line(&first)),
+                response(APP_EXIT, 43, 0, b"exit"),
+            ]
+        );
+        assert!(system.diagnostics.is_empty());
     }
 }
