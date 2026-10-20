@@ -2,6 +2,11 @@
 //!
 //! Each platform module provides the same functions. Linux and Windows are supported hosts;
 //! other platforms compile but report NVX as unavailable.
+//!
+//! The crate-private `ProcessHandle` of each platform holds a process that `open_process` found
+//! with its recorded identity, or a child that the caller has not reaped yet: a pidfd on Linux,
+//! when the host provides them, and a process handle on Windows. Waits and termination go through
+//! it, so they reach that process and never another that reuses its ID.
 
 use std::io;
 use std::time::Duration;
@@ -62,4 +67,18 @@ fn time_left(deadline: Option<std::time::Instant>) -> io::Result<Option<Duration
             .map(Some)
             .ok_or_else(|| io::ErrorKind::TimedOut.into()),
     }
+}
+
+/// Parses exactly 32 hexadecimal digits, in either case, into the 16 bytes that they spell.
+pub(crate) fn parse_hex_id(digits: &str) -> Option<[u8; 16]> {
+    let digits = digits.as_bytes();
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut id = [0; 16];
+    for (byte, pair) in id.iter_mut().zip(digits.chunks_exact(2)) {
+        let nibble = |digit: u8| char::from(digit).to_digit(16);
+        *byte = u8::try_from(nibble(pair[0])? * 16 + nibble(pair[1])?).ok()?;
+    }
+    Some(id)
 }

@@ -1,36 +1,70 @@
 //! Process descriptors, and the hook that detaches a spawned process from its caller.
 
 use std::io;
-#[cfg(test)]
-use std::os::fd::AsFd;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::ptr;
+use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open};
 use nix::libc;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
 use nix::unistd::setsid;
 
 use super::Errno;
 
-/// A pidfd: an owned descriptor that refers to one process, whose ID the kernel cannot reuse
-/// while the descriptor is open.
+/// A pidfd: an owned descriptor that refers to one process. Signals sent through it reach that
+/// process or fail, even once another process reuses its ID.
 pub(crate) struct PidFd(OwnedFd);
 
 impl PidFd {
     /// Opens a pidfd for the process `pid`.
     ///
-    /// Fails with `ESRCH` if no such process exists. Hosts without pidfds, Linux before 5.3 or
-    /// seccomp profiles that reject them, fail with another error.
+    /// Fails with `ESRCH` if no such process exists, with `EINVAL` if `pid` names a thread that
+    /// does not lead its process, and with [`io::ErrorKind::InvalidInput`] if `pid` is not a
+    /// process ID of Linux. Hosts without pidfds, Linux before 5.3 or seccomp profiles that
+    /// reject them, fail with another error.
     pub(crate) fn open(pid: u32) -> io::Result<Self> {
-        let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+        let pid = libc::pid_t::try_from(pid).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{pid} is not a process ID"),
+            )
+        })?;
         // SAFETY: pidfd_open takes a process ID and flags and returns a new descriptor or -1.
         let descriptor = Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) })?;
         // SAFETY: the kernel returned a fresh descriptor that nothing else owns.
         Ok(Self(unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) }))
+    }
+
+    /// Waits up to `timeout` for the process to exit, and returns whether it has.
+    ///
+    /// The pidfd becomes readable once the whole process has exited: its last thread, not only
+    /// its main one. That holds whether or not the caller is the process's parent, and whether
+    /// or not the process has been reaped. A signal that interrupts the wait ends it early.
+    pub(crate) fn wait_exit(&self, timeout: Duration) -> io::Result<bool> {
+        // Round up, so that a wait shorter than a millisecond does not spin.
+        let timeout = PollTimeout::try_from(timeout.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(PollTimeout::MAX);
+        let mut descriptors = [PollFd::new(self.0.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) | Err(Errno::EINTR) => Ok(false),
+            Ok(_) => {
+                let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+                // Since Linux 6.9, a pidfd also reports a hang-up once its process is reaped.
+                if events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+                    Ok(true)
+                } else {
+                    Err(io::Error::other(format!(
+                        "a pidfd reported unexpected events {events:?}"
+                    )))
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Sends `SIGKILL` to the process.

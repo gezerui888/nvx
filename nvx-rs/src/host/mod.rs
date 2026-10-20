@@ -11,9 +11,12 @@
 //! - [`instance`] supervises one VM instance in a directory of its own: it starts OpenVMM and
 //!   waits until the guest is ready, reconciles recorded state with the host, runs workloads,
 //!   and stops the VM. [`report`] reads OpenVMM's outcome report.
-//! - [`session`] speaks the authenticated control protocol, [`process`] launches and terminates
-//!   OpenVMM processes, and [`platform`] holds the primitives of Linux and Windows hosts. Other
-//!   hosts compile but report NVX as unavailable.
+//! - [`session`] speaks the authenticated control protocol, and [`platform`] holds the primitives
+//!   of Linux and Windows hosts. Other hosts compile but report NVX as unavailable.
+//! - [`process`] launches OpenVMM processes. Its verified process references name a process by
+//!   its ID, start time, and host boot, and hold it through a pidfd or a process handle, so that
+//!   waits sleep until it exits and termination reaches only it, whether or not the caller
+//!   started it.
 //! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the

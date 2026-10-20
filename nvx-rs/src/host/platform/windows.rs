@@ -11,9 +11,9 @@ use std::{mem, ptr};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
     ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
@@ -29,6 +29,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
+use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 #[cfg(feature = "cli")]
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{
@@ -74,7 +75,7 @@ fn raw(handle: &OwnedHandle) -> HANDLE {
 }
 
 /// Opens process `pid` with `access`, returning `None` on any Win32 failure.
-fn open_process(pid: u32, access: u32) -> Option<OwnedHandle> {
+fn open_handle(pid: u32, access: u32) -> Option<OwnedHandle> {
     // SAFETY: OpenProcess has no memory-safety preconditions.
     owned(unsafe { OpenProcess(access, 0, pid) })
 }
@@ -120,7 +121,7 @@ fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
 /// OpenVMM always runs as the calling user, so a process that denies access cannot be the
 /// sandbox's VM, even if it reuses the recorded process ID.
 fn open_existing_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
-    if let Some(process) = open_process(pid, access) {
+    if let Some(process) = open_handle(pid, access) {
         return Ok(Some(process));
     }
     match last_error() {
@@ -143,33 +144,131 @@ pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
     creation_time(&process).map(Some)
 }
 
-/// Terminates the process if it still has the recorded identity.
+/// A process that this user may query and wait for, and terminate when [`terminate`] says so,
+/// held through a handle that keeps its ID from naming any other process.
 ///
-/// The open handle pins the process, so the identity check cannot race with PID reuse.
-pub(crate) fn kill_process(pid: u32, start_time: u64) -> io::Result<()> {
-    let Some(process) = open_existing_process(
-        pid,
-        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-    )?
-    else {
-        return Ok(());
-    };
-    if has_exited(&process)? || creation_time(&process)? != start_time {
-        return Ok(());
-    }
-    // SAFETY: the handle has terminate access.
-    if unsafe { TerminateProcess(raw(&process), 1) } == 0 {
-        let error = io::Error::last_os_error();
-        return if has_exited(&process)? {
-            Ok(())
-        } else {
-            Err(error)
-        };
-    }
-    // SAFETY: the handle has synchronize access.
-    unsafe { WaitForSingleObject(raw(&process), 10_000) };
-    Ok(())
+/// [`terminate`]: Self::terminate
+pub(crate) struct ProcessHandle {
+    /// Process handle with query-limited-information and synchronize access.
+    process: OwnedHandle,
+    /// Whether the handle also has terminate access.
+    terminate: bool,
 }
+
+impl ProcessHandle {
+    /// Whether the process's exit wakes its waiters, which it always does on Windows.
+    pub(crate) fn has_exit_event(&self) -> bool {
+        true
+    }
+
+    /// Waits until the process exits or `deadline` passes, and returns whether it exited.
+    pub(crate) fn wait(&self, deadline: Instant) -> io::Result<Option<bool>> {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // Round up, so that a wait shorter than a millisecond does not spin, and never wait
+            // for INFINITE.
+            let milliseconds = u32::try_from(left.as_nanos().div_ceil(1_000_000))
+                .map_or(INFINITE - 1, |value| value.min(INFINITE - 1));
+            // SAFETY: the handle has synchronize access.
+            match unsafe { WaitForSingleObject(raw(&self.process), milliseconds) } {
+                WAIT_OBJECT_0 => return Ok(Some(true)),
+                WAIT_TIMEOUT if Instant::now() >= deadline => return Ok(Some(false)),
+                WAIT_TIMEOUT => {}
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
+    }
+
+    /// Terminates the process with status 1, unless it has exited, and fails if this user may
+    /// not terminate process `pid`.
+    pub(crate) fn kill(&self, pid: u32) -> io::Result<()> {
+        if !self.terminate {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("this user may not terminate process {pid}"),
+            ));
+        }
+        // SAFETY: the handle has terminate access.
+        if unsafe { TerminateProcess(raw(&self.process), 1) } == 0 {
+            let error = io::Error::last_os_error();
+            // An exited process cannot be terminated again.
+            if !has_exited(&self.process)? {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Opens the process `pid` if it still runs with the creation time `start_time`, and returns
+/// `None` if it has exited, even if another process now has its ID.
+///
+/// The handle pins the process before its identity is checked. A process that does not let this
+/// user query it and wait for it belongs to another user, so it is not a process that this user
+/// started, and counts as exited too.
+pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<ProcessHandle>> {
+    let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+    let handle = match open_handle(pid, access | PROCESS_TERMINATE) {
+        Some(process) => Some(ProcessHandle {
+            process,
+            terminate: true,
+        }),
+        None => match last_error() {
+            ERROR_INVALID_PARAMETER => None,
+            ERROR_ACCESS_DENIED => {
+                open_existing_process(pid, access)?.map(|process| ProcessHandle {
+                    process,
+                    terminate: false,
+                })
+            }
+            error => return Err(io::Error::from_raw_os_error(error as i32)),
+        },
+    };
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    if has_exited(&handle.process)? || creation_time(&handle.process)? != start_time {
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}
+
+/// Returns the identity of the current boot: the boot counter that Windows keeps in the registry
+/// value `BootId` of [`BOOT_ID_KEY`] and changes at every boot, little-endian and zero-extended
+/// to 16 bytes.
+pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
+    let key = wide(BOOT_ID_KEY);
+    let name = wide("BootId");
+    let mut value = 0u32;
+    let mut size = mem::size_of::<u32>() as u32;
+    // SAFETY: the names are NUL-terminated, the type flag admits only a REG_DWORD, and the
+    // output buffer holds `size` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            ptr::null_mut(),
+            (&raw mut value).cast(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        let error = io::Error::from_raw_os_error(status as i32);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot read the registry value HKLM\\{BOOT_ID_KEY}\\BootId: {error}"),
+        ));
+    }
+    let mut id = [0; 16];
+    id[..4].copy_from_slice(&value.to_le_bytes());
+    Ok(id)
+}
+
+/// The registry key of the boot counter, under `HKEY_LOCAL_MACHINE`.
+const BOOT_ID_KEY: &str =
+    r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
 
 /// An OpenVMM process launched by this caller, held through its process handle.
 pub(crate) struct LaunchedProcess {
@@ -183,6 +282,20 @@ impl LaunchedProcess {
     /// Returns the numeric process identifier.
     pub(crate) fn id(&self) -> u32 {
         self.pid
+    }
+
+    /// Holds the process through a handle of its own, which outlives this one, and returns it
+    /// with the process's creation time.
+    pub(crate) fn pin(&self) -> io::Result<(ProcessHandle, u64)> {
+        let process = self.process.try_clone()?;
+        let start_time = creation_time(&process)?;
+        Ok((
+            ProcessHandle {
+                process,
+                terminate: true,
+            },
+            start_time,
+        ))
     }
 
     /// Terminates the process and returns whether it exited within `timeout`.

@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Transport;
 use crate::hypervisor::Hypervisor;
@@ -37,8 +37,39 @@ pub fn process_start_time(_pid: u32) -> io::Result<Option<u64>> {
     Ok(None)
 }
 
-pub(crate) fn kill_process(_pid: u32, _start_time: u64) -> io::Result<()> {
-    Ok(())
+/// A verified process, which this host never holds.
+pub(crate) enum ProcessHandle {}
+
+impl ProcessHandle {
+    /// Never called: no handle exists.
+    pub(crate) fn has_exit_event(&self) -> bool {
+        match *self {}
+    }
+
+    /// Never called: no handle exists.
+    pub(crate) fn wait(&self, _deadline: Instant) -> io::Result<Option<bool>> {
+        match *self {}
+    }
+
+    /// Never called: no handle exists.
+    pub(crate) fn kill(&self, _pid: u32) -> io::Result<()> {
+        match *self {}
+    }
+}
+
+/// Reports every process as gone, as [`process_start_time`] does.
+pub(crate) fn open_process(_pid: u32, _start_time: u64) -> io::Result<Option<ProcessHandle>> {
+    Ok(None)
+}
+
+/// Fails: this host cannot verify processes.
+pub(crate) fn pin_child(_pid: u32) -> io::Result<(ProcessHandle, u64)> {
+    Err(unsupported())
+}
+
+/// Fails: this host has no boot identity that NVX reads.
+pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
+    Err(unsupported())
 }
 
 /// Fails: this host cannot export host paths.

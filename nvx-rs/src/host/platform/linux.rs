@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::Transport;
-use crate::host::sys::{self, Errno};
+use crate::host::sys::{self, Errno, PidFd};
 use crate::hypervisor::Hypervisor;
 
 #[cfg(feature = "cli")]
@@ -16,6 +16,9 @@ pub(crate) use crate::host::sys::{interrupted, watch_interrupts, write_interrupt
 
 /// Whether this host can run NVX microVMs.
 pub const SUPPORTED: bool = true;
+
+/// File that holds the identity of the current boot, a UUID that the kernel chooses at random.
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
 /// Returns the start time of a live process, `None` if the process no longer exists, or an error
 /// if its state cannot be determined.
@@ -25,17 +28,24 @@ pub const SUPPORTED: bool = true;
 /// exit, and they keep the process's descriptors, such as an inherited log and its lock, open.
 /// Zombies without other threads count as exited.
 pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
+    let Some(stat) = read_stat(pid)? else {
+        return Ok(None);
+    };
+    start_time_from_stat(pid, &stat, || other_threads_remain(pid))
+}
+
+/// Reads `/proc/<pid>/stat`, or returns `None` if no process has the ID.
+fn read_stat(pid: u32) -> io::Result<Option<String>> {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(Some(stat)),
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
                 || error.raw_os_error() == Some(Errno::ESRCH as i32) =>
         {
-            return Ok(None);
+            Ok(None)
         }
-        Err(error) => return Err(error),
-    };
-    start_time_from_stat(pid, &stat, || other_threads_remain(pid))
+        Err(error) => Err(error),
+    }
 }
 
 /// Interprets the `/proc/<pid>/stat` line of `pid` as [`process_start_time`] does, asking
@@ -45,6 +55,16 @@ pub(crate) fn start_time_from_stat(
     stat: &str,
     other_threads_remain: impl FnOnce() -> io::Result<bool>,
 ) -> io::Result<Option<u64>> {
+    let (state, start_time) = parse_stat(pid, stat)?;
+    match state {
+        "X" => Ok(None),
+        "Z" => Ok(other_threads_remain()?.then_some(start_time)),
+        _ => Ok(Some(start_time)),
+    }
+}
+
+/// Returns the state and the start time in the `/proc/<pid>/stat` line of `pid`.
+fn parse_stat(pid: u32, stat: &str) -> io::Result<(&str, u64)> {
     let malformed = || io::Error::other(format!("/proc/{pid}/stat has an unexpected format"));
     // The command name may contain spaces and parentheses, so the fields start after the last
     // closing parenthesis.
@@ -56,11 +76,7 @@ pub(crate) fn start_time_from_stat(
         .get(19)
         .and_then(|value| value.parse().ok())
         .ok_or_else(malformed)?;
-    match fields[0] {
-        "X" => Ok(None),
-        "Z" => Ok(other_threads_remain()?.then_some(start_time)),
-        _ => Ok(Some(start_time)),
-    }
+    Ok((fields[0], start_time))
 }
 
 /// Returns whether a process has threads besides its main thread.
@@ -77,29 +93,117 @@ pub(crate) fn other_threads_remain(pid: u32) -> io::Result<bool> {
     }
 }
 
-/// Kills the process if it still has the recorded identity.
-///
-/// A pidfd pins the process first, so the identity check cannot race with PID reuse. Hosts
-/// without pidfds (Linux before 5.3, or seccomp profiles that reject them) get an error instead
-/// of a racy kill.
-pub(crate) fn kill_process(pid: u32, start_time: u64) -> io::Result<()> {
-    let process = match sys::PidFd::open(pid) {
-        Ok(process) => process,
-        Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => return Ok(()),
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot pin OpenVMM process {pid} for termination: {error}"),
-            ));
+/// A process that [`open_process`] or [`pin_child`] verified, held through a pidfd. On hosts
+/// without pidfds, only its identity holds it, which waits check at every poll.
+pub(crate) struct ProcessHandle(Option<PidFd>);
+
+impl ProcessHandle {
+    /// Returns a handle without a pidfd, as hosts without pidfds have.
+    #[cfg(test)]
+    pub(crate) fn without_pidfd() -> Self {
+        Self(None)
+    }
+
+    /// Whether the process's exit wakes its waiters: it does through a pidfd.
+    pub(crate) fn has_exit_event(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Waits until the process exits or `deadline` passes, and returns whether it exited, or
+    /// `None` without a pidfd, where the caller polls the process's identity instead.
+    pub(crate) fn wait(&self, deadline: Instant) -> io::Result<Option<bool>> {
+        let Some(pidfd) = &self.0 else {
+            return Ok(None);
+        };
+        loop {
+            if pidfd.wait_exit(deadline.saturating_duration_since(Instant::now()))? {
+                return Ok(Some(true));
+            }
+            if Instant::now() >= deadline {
+                return Ok(Some(false));
+            }
         }
+    }
+
+    /// Sends `SIGKILL` to the process through its pidfd, unless it has exited.
+    ///
+    /// Without a pidfd, it fails rather than signal process `pid`, whose ID another process may
+    /// have reused.
+    pub(crate) fn kill(&self, pid: u32) -> io::Result<()> {
+        let Some(pidfd) = &self.0 else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "cannot pin process {pid} for termination: this host does not provide pidfds"
+                ),
+            ));
+        };
+        match pidfd.kill() {
+            Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => Ok(()),
+            result => result,
+        }
+    }
+}
+
+/// Opens the process `pid` if it still runs with the start time `start_time`, and returns `None`
+/// if it has exited, even if another process now has its ID.
+///
+/// The pidfd is opened before the identity is checked, so it holds the process that the check
+/// then finds: a process that started at `start_time` and still runs held the ID when the pidfd
+/// was opened. Hosts without pidfds, Linux before 5.3 or sandboxes that refuse them, get a
+/// handle without one.
+pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<ProcessHandle>> {
+    let pidfd = match PidFd::open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(error) => match error.raw_os_error().map(Errno::from_raw) {
+            // No process has the ID, or a thread of another process has it, so the process
+            // that had it has exited.
+            Some(Errno::ESRCH | Errno::EINVAL) => return Ok(None),
+            _ if pidfds_unavailable(&error) => None,
+            _ => return Err(error),
+        },
     };
     if process_start_time(pid)? != Some(start_time) {
-        return Ok(());
+        return Ok(None);
     }
-    match process.kill() {
-        Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => Ok(()),
-        result => result,
-    }
+    Ok(Some(ProcessHandle(pidfd)))
+}
+
+/// Holds the child process `pid`, which the caller has not reaped, and returns its start time.
+///
+/// Until it is reaped, a child that exited keeps its ID and its start time.
+pub(crate) fn pin_child(pid: u32) -> io::Result<(ProcessHandle, u64)> {
+    let pidfd = match PidFd::open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(error) if pidfds_unavailable(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let stat = read_stat(pid)?
+        .ok_or_else(|| io::Error::other(format!("child process {pid} has been reaped")))?;
+    let (_, start_time) = parse_stat(pid, &stat)?;
+    Ok((ProcessHandle(pidfd), start_time))
+}
+
+/// Returns whether a failure of `pidfd_open` shows that this host does not provide pidfds:
+/// Linux before 5.3 lacks the call, and seccomp profiles and other sandboxes may refuse it.
+fn pidfds_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error().map(Errno::from_raw),
+        Some(Errno::ENOSYS | Errno::EPERM | Errno::EACCES)
+    )
+}
+
+/// Returns the identity of the current boot: the UUID in `/proc/sys/kernel/random/boot_id`, as
+/// 16 bytes in the order in which it is written.
+pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
+    let text = fs::read_to_string(BOOT_ID_PATH)?;
+    let digits = text.trim_end().replace('-', "");
+    super::parse_hex_id(&digits).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{BOOT_ID_PATH} has an unexpected format"),
+        )
+    })
 }
 
 /// Starts the command in a new session so it outlives the caller and its terminal, and with no
