@@ -11,14 +11,14 @@ use std::{mem, ptr};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
     ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, FILETIME, FreeLibrary,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
-    GetFileInformationByHandle, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, GetFileInformationByHandle, OPEN_EXISTING,
+    ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 #[cfg(feature = "cli")]
 use windows_sys::Win32::Storage::FileSystem::{LockFile, UnlockFile};
@@ -601,17 +601,69 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
+    handle_identity(file.as_raw_handle() as HANDLE)
+}
+
+/// Returns the volume serial number and file index of the file that `file` holds open.
+pub(crate) fn opened_file_identity(file: &fs::File) -> io::Result<(u64, u64)> {
+    handle_identity(file.as_raw_handle() as HANDLE)
+}
+
+/// Returns the volume serial number and file index of the file that `handle` holds open.
+fn handle_identity(handle: HANDLE) -> io::Result<(u64, u64)> {
     // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data for which all-zero bytes are valid.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-    // SAFETY: the handle is open and the output pointer is valid.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
-    {
+    // SAFETY: the caller passes an open handle, and the output pointer is valid.
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok((
         u64::from(information.dwVolumeSerialNumber),
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     ))
+}
+
+/// Claims a launch's fresh log, which `file` holds open.
+///
+/// On Windows the claim is the open handle itself, which the VMM inherits: while any process
+/// holds the log open, an open that shares nothing fails, so the claim needs no further step.
+pub(crate) fn claim_log(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Returns whether a process still holds the claimed log at `path`, which must be the file
+/// `identity`: whether any process holds it open.
+///
+/// An open without access rights takes no part in sharing checks, so the identity is checked
+/// first; an open that shares nothing then fails with a sharing violation while any process,
+/// such as a VMM that inherited the log, holds it. The identity is checked again on the
+/// exclusive handle, because a rename between the opens could have replaced the file.
+pub(crate) fn log_claim_held(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
+    let replaced = || io::Error::other(format!("{} is not the claimed log", path.display()));
+    if file_identity(path)? != identity {
+        return Err(replaced());
+    }
+    let exclusive = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    match exclusive {
+        Ok(file) if opened_file_identity(&file)? == identity => Ok(false),
+        Ok(_) => Err(replaced()),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns whether the live process `pid` that started at `start_time`, which serves the control
+/// endpoint of a launch whose log is the file `log`, is that launch's VMM.
+///
+/// On Windows it is: the endpoint is a named pipe whose name [`control_endpoint`] draws at random
+/// for each launch, so only the VMM that the launch passed it to serves it. The objects of the
+/// process are not examined, as a query of another process's synchronous pipe could wait forever.
+pub(crate) fn serves_launch(_pid: u32, _start_time: u64, _log: (u64, u64)) -> io::Result<bool> {
+    Ok(true)
 }
 
 /// Returns a fresh named-pipe endpoint for OpenVMM to listen on.

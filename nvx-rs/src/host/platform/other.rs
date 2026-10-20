@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -74,6 +74,22 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
 
 /// Fails: this host cannot export host paths.
 pub fn file_identity(_path: &Path) -> io::Result<(u64, u64)> {
+    Err(unsupported())
+}
+
+pub(crate) fn opened_file_identity(_file: &File) -> io::Result<(u64, u64)> {
+    Err(unsupported())
+}
+
+pub(crate) fn claim_log(_file: &File) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub(crate) fn log_claim_held(_path: &Path, _identity: (u64, u64)) -> io::Result<bool> {
+    Err(unsupported())
+}
+
+pub(crate) fn serves_launch(_pid: u32, _start_time: u64, _log: (u64, u64)) -> io::Result<bool> {
     Err(unsupported())
 }
 

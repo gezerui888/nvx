@@ -29,14 +29,15 @@ nvx-rs/
 │   ├── hypervisor.rs
 │   ├── error.rs     nvx::Error and its ErrorKind
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
-│   │                filesystem, session, process, platform, VM instances, outcome reports, and
-│   │                the sandbox launch profile of `nvx.py`, with the Python semantics they keep;
-│   │                with feature `cli`, the `nvx-rs` CLI
+│   │                filesystem, session, process, platform, VM instances, sandbox stores, outcome
+│   │                reports, and the sandbox launch profile of `nvx.py`, with the Python semantics
+│   │                they keep; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
-├── tests/           fake-OpenVMM, CLI, process-supervision, and guest-binary tests, and the
-│                    golden fixtures that Python recorded for the ports of its code, in fixtures/
+├── tests/           fake-OpenVMM, CLI, process-supervision, store, and guest-binary tests, the
+│                    store's record fixtures, and the golden fixtures that Python recorded for the
+│                    ports of its code, in fixtures/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -52,6 +53,7 @@ nvx-rs/
 | `nvx::host::network` | `NetworkPolicy` and `openvmm_arguments`: the egress default and rules, ingress, host-loopback access and forwards as OpenVMM options. Egress rules are lowered exactly into OpenVMM's IPv4 and IPv6 rules by the lowering of egress policy files, with at most 256 rules for each action |
 | `nvx::host::network::policy` | Egress policy files: `compile_policy_file`, `compile_policy_bytes`, and `compile_policy` compile one to a `CompiledEgressPolicy` of native rules; see [Egress policy files](#egress-policy-files) |
 | `nvx::host::filesystem` | The `ExportPlan` of host paths through OpenVMM's aggregate virtio-fs device, the host-mapping table, the reserved guest targets, and `guest_path` and `resolve_guest_path` (also at `nvx::`) |
+| `nvx::host::store` | `SandboxStore`: the runtime records of one sandbox in a private directory with one lock, which every host that supervises the sandbox shares. The `RuntimeRecord` names the running VM: the `ProcessRef` of its VMM, its control endpoint, and the `RuntimeIdentity` that it was launched with, the identities of its OpenVMM, kernel, and initramfs from install or staging metadata and its boot and control contract versions, which decide whether another build of the host may reattach to it. The `LaunchJournal` of a launch holds a marker written before the spawn, the VMM's `ProcessRef` right after it, and an inherited claim on the VMM's log, which proves that a launch that never published its endpoint has exited, so that recovery ends an interrupted launch and signals only a VMM that it holds through a verified `Process`. Records are JSON in one versioned format, and records in any other format fail rather than being migrated |
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::process` | The detached launch of OpenVMM, and verified process references. A `ProcessRef` names one process by its ID, its start time, and the `BootId` of the host boot during which it started. `Process::open` checks a reference and holds its process through a pidfd on Linux or a process handle on Windows, whether or not the caller started it, so that waits sleep until the process exits and termination never reaches a process that reuses its ID. A reference from an earlier boot names an exited process. Linux hosts without pidfds poll the reference instead, and cannot terminate the process |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, Linux and Windows primitives, and OpenVMM's outcome report |
@@ -519,7 +521,10 @@ The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, the CLI test replays the
 [golden scenarios](#golden-scenarios) and checks the guest-feature
 requirement and, on Linux, Ctrl-C, and shared protocol definitions plus golden
-byte fixtures cover both sides of every record. On Linux, a loopback test drives
+byte fixtures cover both sides of every record. The store test crashes
+orchestrator processes at each step of a launch, recovers the VMM stand-ins that
+they leave behind, and loads records that another build wrote, in
+`tests/fixtures/store/`. On Linux, a loopback test drives
 the host `ControlSession` through a broker shim into the real managed agent's
 session, dispatch, and execution engine, and `nvx.py` also lints and tests the
 guest binaries, and runs their integration tests against a build of them:

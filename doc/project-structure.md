@@ -101,11 +101,11 @@ nvx/
 |   |   |-- protocol/            Control-console codec shared by the host and the guest
 |   |   |-- contract.rs          Control-contract versions and release compatibility
 |   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
-|   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, VM instances, the sandbox launch profile, and the `nvx-rs` CLI (feature `cli`)
+|   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, VM instances, sandbox stores, the sandbox launch profile, and the `nvx-rs` CLI (feature `cli`)
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
 |   |   |-- guest/               Programs that run in Linux guests (feature `guest`)
 |   |   `-- bin/                 nvx-rs CLI, nvx-fake-openvmm test double, and the guest binaries
-|   |-- tests/                   Fake-OpenVMM instance lifecycle, CLI, guest-binary, and hypervisor managed-lifecycle tests, and the golden fixtures that Python recorded
+|   |-- tests/                   Fake-OpenVMM instance lifecycle, sandbox store, CLI, guest-binary, and hypervisor managed-lifecycle tests, the store's record fixtures, and the golden fixtures that Python recorded
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     OpenVMM Git submodule

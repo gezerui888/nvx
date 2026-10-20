@@ -1,6 +1,6 @@
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
@@ -247,6 +247,73 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Returns the device and inode of the file that `file` holds open.
+pub(crate) fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Claims a launch's fresh log, which `file` holds open.
+///
+/// The claim is an exclusive `flock` lock. It belongs to the open file description, which the
+/// VMM shares through the standard output and error that it inherits, and only the last close of
+/// that description releases it, so it outlives the caller while the VMM runs.
+pub(crate) fn claim_log(file: &File) -> io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(io::Error::other("another process holds the log")),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Returns whether a process still holds the claimed log at `path`, which must be the file
+/// `identity`: whether its `flock` claim is held through another open file description.
+///
+/// The open follows no link and does not wait, as it would for a FIFO, so that only the claimed
+/// file is examined.
+pub(crate) fn log_claim_held(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(path)?;
+    if opened_file_identity(&file)? != identity {
+        return Err(io::Error::other(format!(
+            "{} is not the claimed log",
+            path.display()
+        )));
+    }
+    // A lock taken here goes when the file closes, at the end of this function.
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Returns whether the live process `pid` that started at `start_time`, which serves the control
+/// endpoint of a launch whose log is the file `log`, is that launch's VMM: whether it holds the
+/// log as its standard output.
+///
+/// The endpoint is the same socket path for every launch of a sandbox, so the log, which every
+/// launch creates afresh, tells its VMM apart. The start time is read again after the
+/// descriptor, so the answer cannot describe another process that reused the ID meanwhile.
+pub(crate) fn serves_launch(pid: u32, start_time: u64, log: (u64, u64)) -> io::Result<bool> {
+    if process_start_time(pid)? != Some(start_time) {
+        return Ok(false);
+    }
+    let held = match fs::metadata(format!("/proc/{pid}/fd/1")) {
+        Ok(metadata) => (metadata.dev(), metadata.ino()) == log,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(Errno::ESRCH as i32) =>
+        {
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(held && process_start_time(pid)? == Some(start_time))
 }
 
 /// Returns the control endpoint OpenVMM should listen on for a sandbox.

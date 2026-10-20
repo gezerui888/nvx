@@ -14,8 +14,9 @@
 //!   hostname and guest network address.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
-//!   network and filesystem policies, control sessions, process and platform primitives, and the
-//!   supervision of VM instances: starting, reconciling, executing workloads, and stopping.
+//!   network and filesystem policies, control sessions, process and platform primitives, the
+//!   supervision of VM instances: starting, reconciling, executing workloads, and stopping, and
+//!   the store of a sandbox's runtime records and launch journal.
 //! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
 //!   running a VM.
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
