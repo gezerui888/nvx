@@ -173,11 +173,13 @@ impl Process {
     /// Finds the process that `reference` names, and returns `None` if it has exited.
     ///
     /// The process has exited when no process has its ID, when the process that has it started
-    /// at another time, and when the reference comes from another boot. On Windows, a process
-    /// that does not let this user query it and wait for it belongs to another user, so it is
-    /// not one that this user started, and counts as exited too.
+    /// at another time, and when the reference comes from another boot.
     ///
     /// An error means that the state of the process cannot be determined: it may still run.
+    /// Fails with [`io::ErrorKind::PermissionDenied`] when the process that has the ID hides its
+    /// identity from this user: on Windows, when this user may not query it, and on Linux, when
+    /// `/proc` does not show it, as its `hidepid` mount option arranges for the processes of
+    /// other users. Linux hosts without pidfds cannot tell such a process from an exited one.
     /// Fails with [`io::ErrorKind::InvalidInput`] for a process ID that the host never assigns,
     /// such as 0, and with [`io::ErrorKind::Unsupported`] on hosts other than Linux and Windows.
     pub fn open(reference: &ProcessRef) -> io::Result<Option<Self>> {
@@ -537,10 +539,11 @@ pub fn kill_child(launched: Launched) -> bool {
 /// `deadline`. Inconclusive checks count as still running.
 ///
 /// The process is held and waited for as [`Process::open`] and [`Process::wait`] do, within the
-/// current boot.
+/// current boot, except that a process whose identity this user may not check counts as exited
+/// wherever [`platform::process_start_time`] says that it has.
 pub fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
     loop {
-        match platform::open_process(pid, start_time) {
+        match open_identity(pid, start_time) {
             Ok(None) => return true,
             Ok(Some(handle)) => {
                 if let Ok(exited) = wait_handle(&handle, pid, start_time, deadline) {
@@ -559,14 +562,47 @@ pub fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
 
 /// Kills the process and waits up to ten seconds for it to disappear.
 ///
-/// The process is held as [`Process::open`] holds it, within the current boot, so it is
-/// signaled only if it still has the identity, and [`Process::kill`] ends it.
+/// The process is held as [`wait_for_exit`] holds it, so it is signaled only if it still has the
+/// identity, and [`Process::kill`] ends it.
 pub fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
-    let Some(handle) = platform::open_process(pid, start_time)? else {
+    let Some(handle) = open_identity(pid, start_time)? else {
         return Ok(true);
     };
     handle.kill(pid)?;
     wait_handle(&handle, pid, start_time, Instant::now() + KILL_TIMEOUT)
+}
+
+/// Opens the process with the identity `pid` and `start_time` for [`wait_for_exit`] and
+/// [`kill`], as [`Process::open`] does within the current boot.
+///
+/// Unlike [`Process::open`], it keeps the rule of [`platform::process_start_time`], which
+/// `host::instance` and the CLI follow: OpenVMM runs as the user that starts it, so a process
+/// that this user may not query on Windows, or that `/proc` hides from it on Linux, has exited.
+fn open_identity(pid: u32, start_time: u64) -> io::Result<Option<platform::ProcessHandle>> {
+    open_identity_with(
+        pid,
+        start_time,
+        platform::open_process,
+        platform::process_start_time,
+    )
+}
+
+/// Opens the process with the identity `pid` and `start_time` with `open`, as [`open_identity`]
+/// does, and when its identity cannot be checked, asks `current` for the start time that
+/// [`platform::process_start_time`] reports.
+fn open_identity_with<H>(
+    pid: u32,
+    start_time: u64,
+    open: impl FnOnce(u32, u64) -> io::Result<Option<H>>,
+    current: impl FnOnce(u32) -> io::Result<Option<u64>>,
+) -> io::Result<Option<H>> {
+    match open(pid, start_time) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => match current(pid)? {
+            Some(current) if current == start_time => Err(error),
+            _ => Ok(None),
+        },
+        result => result,
+    }
 }
 
 #[cfg(test)]
@@ -698,6 +734,43 @@ mod reference_tests {
             |pid, start_time| Ok(Some((pid, start_time))),
         );
         assert_eq!(opened.unwrap(), Some((7, 42)));
+    }
+
+    #[test]
+    fn identities_that_cannot_be_checked_have_exited_where_start_times_say_so() {
+        let hidden = |_: u32, _: u64| {
+            Err::<Option<()>, _>(io::Error::new(io::ErrorKind::PermissionDenied, "hidden"))
+        };
+        // The start time shows no process with the ID, or another one, so the process exited.
+        let gone = open_identity_with(7, 42, hidden, |_| Ok(None));
+        assert!(gone.unwrap().is_none());
+        let reused = open_identity_with(7, 42, hidden, |_| Ok(Some(43)));
+        assert!(reused.unwrap().is_none());
+        // The start time shows the process, or cannot be read, so its state is unknown.
+        let running = open_identity_with(7, 42, hidden, |_| Ok(Some(42)));
+        assert_eq!(running.unwrap_err().to_string(), "hidden");
+        let unreadable = open_identity_with(7, 42, hidden, |_| Err(io::Error::other("unreadable")));
+        assert_eq!(unreadable.unwrap_err().to_string(), "unreadable");
+        // Any other outcome of the open stands.
+        let unasked = |_: u32| -> io::Result<Option<u64>> {
+            panic!("only an identity that cannot be checked asks for the start time")
+        };
+        let opened = open_identity_with(
+            7,
+            42,
+            |pid, start_time| Ok(Some((pid, start_time))),
+            unasked,
+        );
+        assert_eq!(opened.unwrap(), Some((7, 42)));
+        let exited = open_identity_with(7, 42, |_, _| Ok(None::<()>), unasked);
+        assert!(exited.unwrap().is_none());
+        let failed = open_identity_with(
+            7,
+            42,
+            |_, _| Err::<Option<()>, _>(io::Error::other("failed")),
+            unasked,
+        );
+        assert_eq!(failed.unwrap_err().to_string(), "failed");
     }
 
     #[test]
@@ -894,6 +967,33 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn a_process_that_proc_hides_runs_while_its_pidfd_says_so() {
+        let mut child = Reaped(sleeper().spawn().unwrap());
+        let pid = child.0.id();
+        let start_time = platform::process_start_time(pid).unwrap().unwrap();
+        let pidfd = || Some(sys::PidFd::open(pid).unwrap());
+        // `/proc` hides the process, as `hidepid` hides the processes of other users.
+        let hidden = platform::check_identity(pid, start_time, pidfd(), None);
+        assert_eq!(
+            hidden.err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Without a pidfd, it cannot be told from an exited process.
+        let unheld = platform::check_identity(pid, start_time, None, None);
+        assert!(unheld.unwrap().is_none());
+        // Shown, it is held.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let shown = platform::check_identity(pid, start_time, pidfd(), Some(stat));
+        assert!(shown.unwrap().is_some());
+        // Once it has exited, its pidfd says so.
+        let held = pidfd();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let exited = platform::check_identity(pid, start_time, held, None);
+        assert!(exited.unwrap().is_none());
     }
 
     #[test]

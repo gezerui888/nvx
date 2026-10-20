@@ -151,7 +151,7 @@ impl ProcessHandle {
 /// The pidfd is opened before the identity is checked, so it holds the process that the check
 /// then finds: a process that started at `start_time` and still runs held the ID when the pidfd
 /// was opened. Hosts without pidfds, Linux before 5.3 or sandboxes that refuse them, get a
-/// handle without one.
+/// handle without one. Fails as [`check_identity`] does when `/proc` hides the process.
 pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<ProcessHandle>> {
     let pidfd = match PidFd::open(pid) {
         Ok(pidfd) => Some(pidfd),
@@ -163,7 +163,37 @@ pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<Proce
             _ => return Err(error),
         },
     };
-    if process_start_time(pid)? != Some(start_time) {
+    check_identity(pid, start_time, pidfd, read_stat(pid)?)
+}
+
+/// Returns a handle to the process `pid`, through `pidfd` where the host provides pidfds, if
+/// `stat`, its `/proc/<pid>/stat` line read after the pidfd was opened, shows that it still runs
+/// with the start time `start_time`, and `None` if it has exited.
+///
+/// A missing line means that the process exited, unless its pidfd shows that it still runs:
+/// `/proc` then hides it from this user, as the `hidepid` mount option hides the processes of
+/// other users, and the check fails with [`io::ErrorKind::PermissionDenied`] since the process's
+/// identity cannot be read. Without a pidfd, such a process counts as exited.
+pub(crate) fn check_identity(
+    pid: u32,
+    start_time: u64,
+    pidfd: Option<PidFd>,
+    stat: Option<String>,
+) -> io::Result<Option<ProcessHandle>> {
+    let Some(stat) = stat else {
+        if let Some(pidfd) = &pidfd
+            && !pidfd.wait_exit(Duration::ZERO)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "cannot check the identity of process {pid}: /proc hides it from this user"
+                ),
+            ));
+        }
+        return Ok(None);
+    };
+    if start_time_from_stat(pid, &stat, || other_threads_remain(pid))? != Some(start_time) {
         return Ok(None);
     }
     Ok(Some(ProcessHandle(pidfd)))

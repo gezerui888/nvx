@@ -425,6 +425,178 @@ fn a_job_that_ends_its_vmm_wakes_the_waiters() {
     launcher.wait();
 }
 
+#[cfg(windows)]
+#[test]
+fn a_process_that_this_user_may_not_query_has_an_unknown_state() {
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+
+    let (mut child, reference) = restricted::spawn(0);
+    if restricted::may_open(&child.0, PROCESS_QUERY_LIMITED_INFORMATION) {
+        eprintln!("skipping: this user's privileges bypass the security descriptors of processes");
+        return;
+    }
+    // Its identity cannot be checked, so it may still run.
+    let error = Process::open(&reference).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    // The entry points by identity count it as exited, as `process_start_time` does, and leave
+    // it running.
+    assert!(process::wait_for_exit(
+        reference.pid,
+        reference.start_time,
+        Instant::now()
+    ));
+    assert!(process::kill(reference.pid, reference.start_time).unwrap());
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process was ended"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_process_that_this_user_may_not_terminate_is_waited_for_but_never_signaled() {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    let (mut child, reference) =
+        restricted::spawn(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE);
+    if restricted::may_open(&child.0, PROCESS_TERMINATE) {
+        eprintln!("skipping: this user's privileges bypass the security descriptors of processes");
+        return;
+    }
+    let process = open_running(&reference);
+    assert_eq!(process.wait_method(), WaitMethod::Event);
+    let error = process.kill().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(!process.has_exited().unwrap());
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process was ended"
+    );
+
+    // Its creator ends it, which wakes the waiter, and ending a process that exited does nothing.
+    child.0.kill().unwrap();
+    assert!(process.wait(Instant::now() + TIMEOUT).unwrap());
+    process.kill().unwrap();
+    assert_ended(&process);
+}
+
+/// Processes whose security descriptor restricts what this user may do with them.
+#[cfg(windows)]
+mod restricted {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Child, Command, Stdio};
+    use std::{io, mem, ptr};
+
+    use nvx::host::platform;
+    use nvx::host::process::{BootId, ProcessRef};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{SE_KERNEL_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION,
+        SECURITY_MAX_SID_SIZE, WinWorldSid,
+    };
+    use windows_sys::Win32::System::Threading::OpenProcess;
+
+    /// A child process, which is ended when dropped, through the handle with full access that
+    /// its creator holds.
+    pub(crate) struct Running(pub(crate) Child);
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Starts a process that runs for a minute unless it is ended, and whose security
+    /// descriptor then grants everyone, this user included, only `access` to it. Returns it with
+    /// its reference.
+    pub(crate) fn spawn(access: u32) -> (Running, ProcessRef) {
+        let child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child = Running(child);
+        let pid = child.0.id();
+        let reference = ProcessRef {
+            pid,
+            start_time: platform::process_start_time(pid).unwrap().unwrap(),
+            boot: BootId::current().unwrap(),
+        };
+        restrict(&child.0, access);
+        (child, reference)
+    }
+
+    /// Replaces the DACL of `child` with one that grants everyone `access`, or no access when
+    /// `access` is 0.
+    fn restrict(child: &Child, access: u32) {
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut sid_size = SECURITY_MAX_SID_SIZE;
+        // SAFETY: the buffer holds `sid_size` bytes.
+        let created = unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_size,
+            )
+        };
+        assert_ne!(created, 0, "{}", io::Error::last_os_error());
+        // Room for the ACL header, one ACE, and its SID, in 4-byte units, which align the ACL.
+        let size = mem::size_of::<ACL>()
+            + mem::size_of::<ACCESS_ALLOWED_ACE>()
+            + usize::try_from(sid_size).unwrap();
+        let mut buffer = vec![0u32; size.div_ceil(4)];
+        let acl: *mut ACL = buffer.as_mut_ptr().cast();
+        let length = u32::try_from(buffer.len() * 4).unwrap();
+        // SAFETY: the buffer holds `length` bytes, aligned for an ACL.
+        let initialized = unsafe { InitializeAcl(acl, length, ACL_REVISION) };
+        assert_ne!(initialized, 0, "{}", io::Error::last_os_error());
+        if access != 0 {
+            // SAFETY: the ACL has room for the ACE, and the SID is valid.
+            let added =
+                unsafe { AddAccessAllowedAce(acl, ACL_REVISION, access, sid.as_mut_ptr().cast()) };
+            assert_ne!(added, 0, "{}", io::Error::last_os_error());
+        }
+        // SAFETY: the creator's handle has WRITE_DAC access, and the ACL is valid.
+        let status = unsafe {
+            SetSecurityInfo(
+                child.as_raw_handle(),
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                acl,
+                ptr::null(),
+            )
+        };
+        assert_eq!(
+            status,
+            ERROR_SUCCESS,
+            "cannot restrict a process: {}",
+            io::Error::from_raw_os_error(status as i32)
+        );
+    }
+
+    /// Returns whether this user may still open `child` with `access`, as a user may whose
+    /// privileges bypass security descriptors.
+    pub(crate) fn may_open(child: &Child, access: u32) -> bool {
+        // SAFETY: OpenProcess has no memory-safety preconditions.
+        let handle = unsafe { OpenProcess(access, 0, child.id()) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle is open, and nothing else owns it.
+        unsafe { CloseHandle(handle) };
+        true
+    }
+}
+
 /// Job objects, which Windows orchestrators run in.
 #[cfg(windows)]
 mod job {

@@ -183,6 +183,10 @@ impl ProcessHandle {
     /// not terminate process `pid`.
     pub(crate) fn kill(&self, pid: u32) -> io::Result<()> {
         if !self.terminate {
+            // A process that exited needs no termination.
+            if has_exited(&self.process)? {
+                return Ok(());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("this user may not terminate process {pid}"),
@@ -203,34 +207,31 @@ impl ProcessHandle {
 /// Opens the process `pid` if it still runs with the creation time `start_time`, and returns
 /// `None` if it has exited, even if another process now has its ID.
 ///
-/// The handle pins the process before its identity is checked. A process that does not let this
-/// user query it and wait for it belongs to another user, so it is not a process that this user
-/// started, and counts as exited too.
+/// The handle pins the process before its identity is checked. Fails with
+/// [`io::ErrorKind::PermissionDenied`] if this user may not query the process that has the ID
+/// and wait for it, since its identity then cannot be checked.
 pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<ProcessHandle>> {
     let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
-    let handle = match open_handle(pid, access | PROCESS_TERMINATE) {
-        Some(process) => Some(ProcessHandle {
-            process,
-            terminate: true,
-        }),
-        None => match last_error() {
-            ERROR_INVALID_PARAMETER => None,
-            ERROR_ACCESS_DENIED => {
-                open_existing_process(pid, access)?.map(|process| ProcessHandle {
-                    process,
-                    terminate: false,
-                })
-            }
-            error => return Err(io::Error::from_raw_os_error(error as i32)),
-        },
+    let mut terminate = true;
+    let mut opened = open_handle(pid, access | PROCESS_TERMINATE);
+    if opened.is_none() && last_error() == ERROR_ACCESS_DENIED {
+        terminate = false;
+        opened = open_handle(pid, access);
+    }
+    let Some(process) = opened else {
+        return match last_error() {
+            ERROR_INVALID_PARAMETER => Ok(None),
+            ERROR_ACCESS_DENIED => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot check the identity of process {pid}: this user may not query it"),
+            )),
+            error => Err(io::Error::from_raw_os_error(error as i32)),
+        };
     };
-    let Some(handle) = handle else {
-        return Ok(None);
-    };
-    if has_exited(&handle.process)? || creation_time(&handle.process)? != start_time {
+    if has_exited(&process)? || creation_time(&process)? != start_time {
         return Ok(None);
     }
-    Ok(Some(handle))
+    Ok(Some(ProcessHandle { process, terminate }))
 }
 
 /// Returns the identity of the current boot: the boot counter that Windows keeps in the registry
